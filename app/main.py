@@ -1,17 +1,18 @@
 """FastAPI application: REST endpoints + static single-page workbench."""
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import config
+from . import config, pixel_masks
 from .dicom_catalog import DEFAULT_PROFILE, PROFILES
-from .jobs import STORE, resolve_options, run
+from .jobs import STORE, _attach_masks, resolve_options, run
 from .residue_gate import GateBlocked
-from .schemas import AnonymizationOptions
+from .schemas import AnonymizationOptions, MaskPreviewRequest
 
 app = FastAPI(
     title="DICOM 检查匿名化工作台",
@@ -89,6 +90,8 @@ def _serialize(payload: dict, job_id: str, profile_label: str,
         "counts": payload["counts"],
         "patients": payload["patients"],
         "gate": payload.get("gate"),
+        "pixel_masks": payload.get("pixel_masks"),
+        "mask_errors": payload.get("mask_errors", []),
     }
 
 
@@ -97,7 +100,8 @@ def preview(job_id: str, payload: AnonymizationOptions) -> dict:
     job, profile_name, profile_label, options, salt = _prepare(
         job_id, payload.model_dump())
     try:
-        result = run(job, profile_name, options, salt, write=False)
+        result = run(job, profile_name, options, salt, write=False,
+                     pixel_masks_payload=payload.pixel_masks)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return _serialize(result, job_id, profile_label, options)
@@ -111,7 +115,16 @@ def process(job_id: str, payload: AnonymizationOptions) -> dict:
     # A synchronous route runs in the FastAPI threadpool, so large studies
     # do not block the event loop (preview/status/download stay responsive).
     try:
-        run(job, profile_name, options, salt, write=True)
+        run(job, profile_name, options, salt, write=True,
+            pixel_masks_payload=payload.pixel_masks)
+    except pixel_masks.MaskBlocked as blocked:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(blocked),
+                "pixel_mask_errors": blocked.entries,
+            },
+        )
     except GateBlocked as blocked:
         raise HTTPException(
             status_code=409,
@@ -123,9 +136,6 @@ def process(job_id: str, payload: AnonymizationOptions) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    if job.status == "error":
-        raise HTTPException(status_code=400,
-                            detail=job.error or "匿名化处理失败。")
     return {
         "job_id": job_id,
         "status": "done",
@@ -135,7 +145,163 @@ def process(job_id: str, payload: AnonymizationOptions) -> dict:
         "warnings": job.last_result["warnings"] if job.last_result else [],
         "counts": job.last_result["counts"] if job.last_result else {},
         "gate": job.last_result.get("gate") if job.last_result else None,
+        "pixel_masks": (job.last_result or {}).get("pixel_masks"),
     }
+
+
+@app.get("/api/jobs/{job_id}/files/{file_index}/thumbnail")
+def thumbnail(job_id: str, file_index: int, frame: int = 1):
+    """Return a down-scaled PNG of one *output* frame.
+
+    The dataset is metadata-anonymised in memory (so the user sees exactly
+    what the ZIP would contain) but pixel masks are not applied here -- the
+    editor overlays rectangles client-side.
+    """
+    job = _get_job(job_id)
+    fi, ds, geom = _anonymised_frame(job, file_index, frame)
+    try:
+        rgb, _ = pixel_masks.render_frame_rgb(ds, frame - 1)
+    except pixel_masks.MaskUnsupported as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"file_index": file_index,
+                    "source_path": fi.source_path, "message": str(exc)})
+    except pixel_masks.MaskValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    image = pixel_masks.downscale(rgb, MAX_THUMBNAIL_EDGE)
+    png = pixel_masks.encode_png(image)
+    return Response(
+        content=png, media_type="image/png",
+        headers={
+            "X-Dicom-Rows": str(geom.rows),
+            "X-Dicom-Columns": str(geom.columns),
+            "X-Dicom-Frames": str(geom.frame_count),
+            "X-Dicom-Frame": str(frame),
+            "X-Thumbnail-Width": str(image.shape[1]),
+            "X-Thumbnail-Height": str(image.shape[0]),
+            "X-Photometric-Interpretation": geom.photometric,
+            "Cache-Control": "no-store",
+        })
+
+
+@app.post("/api/jobs/{job_id}/files/{file_index}/mask-preview")
+def mask_preview(job_id: str, file_index: int, payload: MaskPreviewRequest):
+    """Apply the submitted masks to one frame and return the rendered PNG.
+
+    Runs the full metadata anonymisation in memory first, so the preview
+    matches the packaged output byte-for-byte (masked regions included).
+    """
+    job = _get_job(job_id)
+    frame = payload.frame
+    matching = [m for m in payload.pixel_masks if m.file_index == file_index]
+    fi, ds, geom = _anonymised_frame(
+        job, file_index, frame, masks=matching,
+        profile=payload.profile, options_payload=payload)
+    try:
+        rgb, _ = pixel_masks.render_frame_rgb(ds, frame - 1)
+    except pixel_masks.MaskUnsupported as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"file_index": file_index,
+                    "source_path": fi.source_path, "message": str(exc)})
+    image = pixel_masks.downscale(rgb, MAX_PREVIEW_EDGE)
+    png = pixel_masks.encode_png(image)
+    rect_count = sum(len(g.rectangles)
+                     for m in matching for g in m.groups)
+    return {
+        "job_id": job_id,
+        "file_index": file_index,
+        "source_path": fi.source_path,
+        "frame": frame,
+        "frame_count": geom.frame_count,
+        "rows": geom.rows,
+        "columns": geom.columns,
+        "rectangle_count": rect_count,
+        "photometric_interpretation": geom.photometric,
+        "image_width": image.shape[1],
+        "image_height": image.shape[0],
+        "image_png_base64": base64.b64encode(png).decode("ascii"),
+    }
+
+
+def _get_job(job_id: str):
+    try:
+        return STORE.get(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期。")
+
+
+def _anonymised_frame(job, file_index: int, frame: int,
+                      masks=None, profile: str | None = None,
+                      options_payload=None):
+    """Metadata-anonymise a single source file in memory and return
+    ``(FileInfo-like, dataset, geometry)``.  When ``masks`` are given they are
+    applied to the anonymised dataset (mask preview)."""
+    from .anonymizer import Anonymizer, FileInfo
+
+    if not 0 <= file_index < len(job.sources):
+        raise HTTPException(status_code=404,
+                            detail=f"文件序号 {file_index} 不存在。")
+    if profile is not None and options_payload is not None:
+        model = AnonymizationOptions(
+            **options_payload.model_dump(exclude={"pixel_masks"}))
+        try:
+            profile_name, options = resolve_options(
+                model.profile, model.overrides())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        salt = model.salt or config.PSEUDONYM_SALT
+    else:
+        profile_name, options = resolve_options(
+            DEFAULT_PROFILE, None)
+        salt = config.PSEUDONYM_SALT
+
+    rel = job.relpaths[file_index]
+    fi = FileInfo(index=file_index, source_path=rel)
+    anon = Anonymizer(options=options, salt=salt)
+    infos = [fi]
+    anon.prescan(infos, lambda info: job.sources[info.index])
+    if not fi.is_dicom:
+        raise HTTPException(status_code=422,
+                            detail={"file_index": file_index,
+                                    "source_path": rel,
+                                    "message": fi.error
+                                    or "不是可匿名化的 DICOM 文件。"})
+    if not fi.maskable:
+        raise HTTPException(
+            status_code=422,
+            detail={"file_index": file_index, "source_path": rel,
+                    "message": fi.mask_reason or "该影像不支持像素遮罩。"})
+    if not 1 <= frame <= (fi.frame_count or 1):
+        raise HTTPException(
+            status_code=400,
+            detail=f"帧号 {frame} 超出总帧数 {fi.frame_count}。")
+    if masks:
+        errors = _attach_masks(infos, masks)
+        if errors:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "遮罩参数无效。",
+                        "pixel_mask_errors": errors})
+    ds = anon.apply_file(fi, job.sources[file_index], None)
+    if ds is None:
+        raise HTTPException(status_code=422,
+                            detail={"file_index": file_index,
+                                    "source_path": rel,
+                                    "message": fi.error
+                                    or "影像无法解码。"})
+    try:
+        geom = pixel_masks.inspect_image(ds)
+    except pixel_masks.MaskUnsupported as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"file_index": file_index, "source_path": rel,
+                    "message": str(exc)})
+    return fi, ds, geom
+
+
+MAX_THUMBNAIL_EDGE = 640
+MAX_PREVIEW_EDGE = 720
 
 
 @app.get("/api/jobs/{job_id}/status")
@@ -165,6 +331,10 @@ def download(job_id: str):
         raise HTTPException(
             status_code=409,
             detail="残留标识门禁未通过，ZIP 未生成；请调整匿名化选项后重新执行。")
+    if job.status == "error":
+        raise HTTPException(
+            status_code=409,
+            detail=job.error or "匿名化处理失败，ZIP 未生成。")
     if job.status != "done" or not job.zip_path or \
             not job.zip_path.exists():
         raise HTTPException(status_code=409,

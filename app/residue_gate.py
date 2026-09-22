@@ -310,8 +310,11 @@ class IdentifierGate:
         self.result.scanned_dicom_files += 1
         # (dataset, location-prefix); file meta information is scanned too.
         stack: list[tuple[Dataset, str]] = [(ds, "")]
-        if ds.file_meta is not None:
-            stack.append((ds.file_meta, "文件元信息 / "))
+        # pydicom 3.x raises AttributeError when file_meta is absent;
+        # getattr keeps compatibility with 2.x (returns None) and 3.x.
+        file_meta = getattr(ds, "file_meta", None)
+        if file_meta is not None:
+            stack.append((file_meta, "文件元信息 / "))
         while stack:
             current, prefix = stack.pop()
             for de in current:
@@ -453,4 +456,12 @@ class IdentifierGate:
                 name = None
         if not name:
             name = pydicom.datadict.keyword_for_tag(tag)
-        return f"{token} {name}" if name else token
+        if not name:
+            return token
+        label = f"{token} {name}"
+        # Also expose the camelCase keyword (e.g. "SourceImageSequence") so
+        # location strings stay greppable by programmatic tag name.
+        keyword = pydicom.datadict.keyword_for_tag(tag)
+        if keyword and keyword != name:
+            label += f" / {keyword}"
+        return label

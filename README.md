@@ -1,9 +1,9 @@
 # DICOM 检查匿名化工作台
 
-一个纯本地运行的 Web 工作台：上传一组 DICOM 影像 → 选择匿名化配置 → **预览逐字段标签变更** → 残留标识门禁扫描 → 一键打包下载匿名化 ZIP。无需任何第三方账号，不向外部发送数据。
+一个纯本地运行的 Web 工作台：上传一组 DICOM 影像 → 选择匿名化配置 → **预览逐字段标签变更 / 绘制人工像素遮罩** → 残留标识门禁扫描 → 一键打包下载匿名化 ZIP。无需任何第三方账号，不向外部发送数据。
 
-- **后端**：FastAPI + [pydicom](https://pydicom.github.io/)
-- **前端**：原生 HTML/CSS/JS 单页应用（无 CDN、无构建步骤）
+- **后端**：FastAPI + [pydicom](https://pydicom.github.io/) + numpy
+- **前端**：原生 HTML/CSS/JS 单页应用（无 CDN、无构建步骤，缩略图/遮罩编辑器为原生 canvas）
 - **规范**：遵循 DICOM PS3.15 Annex E「基础应用保密配置文件」及标准保留选项
 - **交付**：Dockerfile + docker-compose，单条命令启动；镜像仅含 Python 运行时与 PyPI 依赖，**无需注册任何第三方账号 / 云服务**
 
@@ -77,6 +77,7 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
    - 统计磁贴（删除/置空/伪名替换/UID 重写/日期平移/剥离私有标签数量）
    - **逐字段变更清单**：标签号、名称、VR、动作、原值 → 新值，支持搜索、按动作过滤、分页
    - 每个文件的 Patient / Study / Series / SOP UID 原 → 新映射
+   - **人工像素遮罩**（见下节）：在输出影像缩略图上绘制 / 移动 / 删除矩形，选择当前帧或全部帧
    - 患者伪名表与每患者日期平移天数
    - **残留标识门禁结果**：扫描文件数/文本值数、比对的源标识数与命中计数（见下节）
    - 警告（悬挂引用、`Burned In Annotation`、重复 SOP UID 等）
@@ -114,7 +115,7 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 - `strip_overlays`：移除 60xx 覆盖层、50xx 曲线与图形注释序列（可能烧录文字）；
 - 人员姓名（PN）、机构、设备、医护、Accession、描述/注释等按所选选项保留或清空；
 - 写入去标识声明：`PatientIdentityRemoved = YES`、`De-identificationMethod` 及标准代码序列（113100 等）；
-- `Burned In Annotation = YES` / `Recognizable Visual Features = YES` 时给出像素级人工核查警告（工具**不修改像素**）；
+- `Burned In Annotation = YES` / `Recognizable Visual Features = YES` 时给出像素级人工核查警告（可在预览页用人工像素遮罩覆盖烧录区域）；
 - DICOMDIR 跳过并警告（其记录基于原 UID，需用介质工具重建）。
 
 ### 残留标识门禁（Residual Identifier Gate）
@@ -132,6 +133,29 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 
 > 门禁的作用是拦截标签层面的意外泄漏，**不能替代像素中烧录文字的人工核查**；此外「悬挂引用警告」会原样写出被引用的原始 UID（该对象不在本次上传中），门禁同样会据此拦截并提示——这是设计行为：发布包不应出现任何原始 UID。
 
+### 人工像素遮罩（Manual Pixel Masks）
+
+针对像素中烧录的姓名、床号、检查编号或面部/体表特征，预览页提供「人工像素遮罩」标签页：
+
+1. 左侧列出**输出影像**（即标签匿名化后的实例），每个文件标注原始宽高、帧数与 PhotometricInterpretation；无法遮罩的文件（压缩传输语法、像素描述缺失等）显示锁定图标与原因；
+2. 选择文件后显示该影像的**缩略图 PNG**（服务端按原始像素经窗宽窗位归一化生成，多帧可切换），在 canvas 上**拖拽绘制矩形**、**拖拽矩形内部移动**、选中后按 `Delete` 或「删除选中」移除；新矩形可选择「仅当前帧」或「全部帧」；
+3. 前端始终按缩略图/原始尺寸的缩放比例，把矩形换算为**原始像素坐标**（`x, y, width, height`，整数）提交，帧范围为 1 基的 `frame_start`/`frame_end` 或 `all_frames`；
+4. 「生成遮罩预览」会在服务端对**执行后影像**渲染当前帧 PNG（base64 返回），与打包结果逐像素一致；
+5. 执行时遮罩区域就地填充**与光度解释匹配的安全背景色**：
+   - `MONOCHROME2` / `RGB` 填 0（黑）；
+   - `MONOCHROME1` 填最大存储值（反转 VOI 下仍显示为黑）；
+   - `YBR_FULL` 填 Y=0、Cb=Cr=128（转换回 RGB 为黑）；
+6. 全程**只编辑原始字节缓冲**：多帧数/尺寸、`Rows/Columns/NumberOfFrames`、`WindowCenter/WindowWidth`、`PhotometricInterpretation`、`PlanarConfiguration` 与传输语法 UID 均不改变；
+7. 仅支持**未压缩传输语法**（Implicit/Explicit VR Little Endian、Explicit VR Big Endian、Deflated Explicit VR LE）。**压缩传输语法**（JPEG/JPEG-LS/JPEG 2000/RLE 等）、`PALETTE COLOR`、`YBR_FULL_422` 原生布局或 PixelData 无法解码（缺失/长度与声明尺寸不符）的文件一旦被提交遮罩，`/process` 返回 **422**，在 `detail.pixel_mask_errors` 中逐文件给出可定位的原因（文件序号、路径、理由），**ZIP 不会生成**，下载接口同步返回 409；
+8. 报告的 `pixel_masks` 段**只记录文件路径、帧范围（如 `"1-3"`/`"all"`）与矩形计数**，不包含任何像素坐标。
+
+遮罩能力的元数据探测（`maskable`/`mask_reason`/尺寸/帧数）随每次预览响应逐文件返回；缩略图与遮罩预览接口为：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/jobs/{id}/files/{index}/thumbnail?frame=N` | 输出影像指定帧的缩略图 PNG（含原始尺寸/帧数响应头） |
+| `POST` | `/api/jobs/{id}/files/{index}/mask-preview` | 按当前选项应用遮罩后返回该帧 PNG（base64）与几何信息 |
+
 ### 预设方案
 
 | 方案 | 适用 | 要点 |
@@ -141,7 +165,7 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 | **推荐** | 科研外发 | 日期固定偏移（纵向间隔一致）、保留年龄/性别与协议名、剥离覆盖层 |
 | 严格 | 最大化去标识 | 清空一切日期/特征/自由文本、剥离私有标签与覆盖层 |
 
-> **注意**：任何 DICOM 标签层面的去标识都无法处理**像素中烧录的文字**（姓名、床号、面部特征）。本工具会读取 `(0028,0301)` 等标记提示风险，但发布前仍需人工核查影像内容。
+> **注意**：标签层面的去标识不处理**像素中烧录的文字**（姓名、床号、面部特征）。本工具会读取 `(0028,0301)` 等标记提示风险，并在预览页提供人工像素遮罩对相应帧的矩形区域填充安全背景色；发布前仍需逐影像人工核查遮罩是否完整覆盖。
 
 ---
 
@@ -166,8 +190,10 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 | `GET` | `/api/health` | 健康检查 |
 | `GET` | `/api/profiles` | 预设方案与选项定义 |
 | `POST` | `/api/jobs` | 上传文件（multipart，字段名 `files`，可多个） |
-| `POST` | `/api/jobs/{id}/preview` | 计算变更预览（不落盘），返回 `gate` 门禁扫描结果 |
-| `POST` | `/api/jobs/{id}/process` | 执行匿名化；门禁通过才生成 ZIP，否则返回 `409`（明细在 `detail.residue_identifier_gate.hits`） |
+| `POST` | `/api/jobs/{id}/preview` | 计算变更预览（不落盘），返回 `gate` 门禁结果与逐文件 `maskable` 遮罩能力 |
+| `GET` | `/api/jobs/{id}/files/{index}/thumbnail?frame=N` | 输出影像缩略图 PNG（未压缩影像） |
+| `POST` | `/api/jobs/{id}/files/{index}/mask-preview` | 遮罩预览：返回应用遮罩后的帧 PNG（base64） |
+| `POST` | `/api/jobs/{id}/process` | 执行匿名化；门禁通过才生成 ZIP，否则返回 `409`（明细在 `detail.residue_identifier_gate.hits`）；遮罩无法应用时返回 `422`（明细在 `detail.pixel_mask_errors`） |
 | `GET` | `/api/jobs/{id}/status` | 任务状态（`uploaded/previewed/processing/done/blocked/error`） |
 | `GET` | `/api/jobs/{id}/download` | 下载 ZIP（状态为 `blocked` 时返回 `409`） |
 | `DELETE` | `/api/jobs/{id}` | 立即删除任务及其文件 |
@@ -180,11 +206,32 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
   "keep_dates": true,
   "keep_chars": true,
   "strip_overlays": true,
-  "salt": null
+  "salt": null,
+  "pixel_masks": [
+    {
+      "file_index": 0,
+      "groups": [
+        {
+          "all_frames": false,
+          "frame_start": 1,
+          "frame_end": 3,
+          "rectangles": [
+            {"x": 120, "y": 200, "width": 80, "height": 24}
+          ]
+        },
+        {
+          "all_frames": true,
+          "rectangles": [
+            {"x": 0, "y": 0, "width": 64, "height": 64}
+          ]
+        }
+      ]
+    }
+  ]
 }
 ```
 
-所有选项字段省略或传 `null` 时沿用所选预设；显式传 `true`/`false` 覆盖预设。
+`pixel_masks` 可省略（表示不加遮罩）；矩形坐标为**原始像素**整数坐标，`all_frames: true` 时无需传帧范围。所有选项字段省略或传 `null` 时沿用所选预设；显式传 `true`/`false` 覆盖预设。
 
 API 文档（Swagger UI）：<http://localhost:8000/docs>。
 
@@ -197,6 +244,7 @@ app/
   main.py            # FastAPI 路由 / 静态页面
   jobs.py            # 任务生命周期、预览调度、门禁接入、ZIP 打包与报告
   anonymizer.py      # 伪名 / UID 映射 / 日期平移 / 递归序列遍历引擎
+  pixel_masks.py     # 人工像素遮罩：能力探测、原始像素填充、缩略图/PNG 渲染
   residue_gate.py    # 残留标识门禁：递归扫描输出 DICOM（含序列）与报告
   dicom_catalog.py   # PS3.15 标签规则表与 4 个预设方案
   schemas.py         # 请求/响应模型（含门禁结果模型）
@@ -212,7 +260,9 @@ requirements.txt
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q          # 36 项测试：UID 一致性、引用遍历、确定性、日期间隔、
+pytest -q          # 67 项测试：UID 一致性、引用遍历、确定性、日期间隔、
                    #          残留标识门禁（分词/边界、序列深层命中、
-                   #          409 拦截、报告摘要）等
+                   #          409 拦截、报告摘要）、人工像素遮罩（MONOCHROME1/2、
+                   #          RGB/YBR、多帧/帧范围、大小端、压缩语法 422 拦截、
+                   #          缩略图与遮罩预览、坐标无关报告）等
 ```

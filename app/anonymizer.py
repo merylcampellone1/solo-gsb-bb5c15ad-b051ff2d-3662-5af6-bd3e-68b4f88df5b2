@@ -37,6 +37,7 @@ from pydicom.dataset import Dataset
 from pydicom.tag import BaseTag, Tag
 from pydicom.uid import UID_dictionary
 
+from . import pixel_masks
 from .dicom_catalog import (
     BLANK,
     DATE,
@@ -152,6 +153,13 @@ class FileInfo:
     sop_class_uid: str | None = None
     sop_class_name: str | None = None
     modality: str | None = None
+    # pixel mask capability (filled by prescan probe)
+    maskable: bool = False
+    mask_reason: str | None = None
+    rows: int | None = None
+    columns: int | None = None
+    frame_count: int | None = None
+    photometric: str | None = None
     patient_key: str | None = None
     old_patient_id: str | None = None
     old_patient_name: str | None = None
@@ -165,6 +173,10 @@ class FileInfo:
     new_sop_uid: str | None = None
     output_path: str | None = None
     error: str | None = None
+    # Manual pixel masks (fragments as produced by pixel_masks.build_frames)
+    mask_fragments: list[dict] | None = None
+    mask_summary: dict | None = None
+    mask_error: str | None = None
     changes: list[Change] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -279,6 +291,7 @@ class Anonymizer:
             "files": 0,
             "skipped": 0,
             "errors": 0,
+            "pixel_masks": 0,
         }
         self.global_warnings: list[str] = []
         self._used_outputs: set[str] = set()
@@ -325,7 +338,7 @@ class Anonymizer:
                 fi.error = f"无法解析为 DICOM 文件：{exc}"
                 continue
             if not (hasattr(ds, "SOPInstanceUID")
-                    or (ds.file_meta
+                    or (getattr(ds, "file_meta", None)
                         and getattr(ds.file_meta, "MediaStorageSOPInstanceUID",
                                     None))):
                 fi.is_dicom = False
@@ -350,6 +363,15 @@ class Anonymizer:
                                     or "") or None
             fi.old_sop_uid = str(getattr(ds, "SOPInstanceUID", "")
                                   or "") or None
+
+            # Metadata-only pixel-mask capability probe (never decodes pixels).
+            probe = pixel_masks.probe(ds)
+            fi.maskable = probe["maskable"]
+            fi.mask_reason = probe["reason"]
+            fi.rows = probe["rows"]
+            fi.columns = probe["columns"]
+            fi.frame_count = probe["frame_count"]
+            fi.photometric = probe["photometric_interpretation"]
 
             ctx = self.patient_context(ds)
             fi.patient_key = ctx.key
@@ -396,7 +418,26 @@ class Anonymizer:
             self.patient_context(ds)
         try:
             self._rewrite_dataset(ds, ctx, fi)
-            self._add_deidentification_attributes(ds, ctx, fi)
+            # Pixel masks run after metadata rewrite but before the
+            # de-identification declaration so the method list can record it.
+            mask_summary = None
+            if fi.mask_fragments:
+                mask_summary = pixel_masks.apply_masks(ds, fi.mask_fragments)
+                fi.mask_summary = mask_summary
+                self.counts["pixel_masks"] = \
+                    self.counts.get("pixel_masks", 0) + 1
+            self._add_deidentification_attributes(ds, ctx, fi,
+                                                   mask_summary)
+        except pixel_masks.MaskUnsupported as exc:
+            fi.mask_error = str(exc)
+            fi.error = f"像素遮罩无法应用：{exc}"
+            self.counts["errors"] += 1
+            return None
+        except pixel_masks.MaskValidationError as exc:
+            fi.mask_error = str(exc)
+            fi.error = f"像素遮罩参数无效：{exc}"
+            self.counts["errors"] += 1
+            return None
         except Exception as exc:  # noqa: BLE001
             fi.error = f"匿名化处理失败：{exc}"
             self.counts["errors"] += 1
@@ -449,8 +490,9 @@ class Anonymizer:
     def _all_datasets(ds: Dataset, include_meta: bool = True
                       ) -> Iterable[Dataset]:
         stack: list[Dataset] = []
-        if include_meta and ds.file_meta is not None:
-            stack.append(ds.file_meta)
+        file_meta = getattr(ds, "file_meta", None)
+        if include_meta and file_meta is not None:
+            stack.append(file_meta)
         stack.append(ds)
         while stack:
             current = stack.pop()
@@ -461,8 +503,9 @@ class Anonymizer:
 
     def _rewrite_dataset(self, ds: Dataset, ctx: PatientContext,
                          fi: FileInfo) -> None:
-        if ds.file_meta is not None:
-            self._apply_level(ds.file_meta, ctx, fi, is_meta=True)
+        file_meta = getattr(ds, "file_meta", None)
+        if file_meta is not None:
+            self._apply_level(file_meta, ctx, fi, is_meta=True)
         self._apply_level(ds, ctx, fi, is_meta=False)
 
     def _resolve_action(self, tag: BaseTag, vr: str
@@ -666,7 +709,9 @@ class Anonymizer:
 
     def _add_deidentification_attributes(self, ds: Dataset,
                                          ctx: PatientContext,
-                                         fi: FileInfo) -> None:
+                                         fi: FileInfo,
+                                         mask_summary: dict | None = None
+                                         ) -> None:
         methods = ["PS3.15 Basic Application Confidentiality Profile"]
         codes = [("113100", "Basic Application Confidentiality Profile")]
         if self.opts.get("keep_dates"):
@@ -684,6 +729,11 @@ class Anonymizer:
         methods.append("UIDs replaced with deterministic 2.25 UIDs")
         if self.opts.get("strip_overlays"):
             methods.append("Overlays/curves/graphic annotations removed")
+        if mask_summary and mask_summary.get("rectangles"):
+            methods.append(
+                f"Manual rectangular pixel masks applied "
+                f"({mask_summary['rectangles']} rectangles, "
+                f"frames {mask_summary.get('frames') or '1'})")
 
         ds.PatientIdentityRemoved = "YES"
         self._record_simple(fi, Tag(0x0012, 0x0062),
@@ -715,7 +765,8 @@ class Anonymizer:
         burned = getattr(ds, "BurnedInAnnotation", None)
         if burned and str(burned).strip().upper() in ("YES", "Y", "01"):
             msg = ("Burned In Annotation (0028,0301) 标记为 YES：像素中可能"
-                   "烧录了身份信息，本工具不修改像素，请人工核查。")
+                   "烧录了身份信息，未绘制遮罩的区域不会被修改，请在"
+                   "「人工像素遮罩」标签页逐帧核查。")
             fi.warnings.append(msg)
             if msg not in self.global_warnings:
                 self.global_warnings.append(

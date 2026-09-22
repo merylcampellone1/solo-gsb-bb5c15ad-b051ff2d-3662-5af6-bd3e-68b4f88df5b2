@@ -9,6 +9,12 @@ const state = {
   page: 0,
   pageSize: 50,
   filteredChanges: [],
+  // pixel masks keyed by file index:
+  // [{ id, scope: "frame"|"all", frame: 1-based,
+  //    rect: {x,y,width,height} original pixels }]
+  masks: {},
+  // locatable per-file errors from the last blocked /process call
+  lastMaskErrors: [],
 };
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -124,6 +130,7 @@ $("#btnUpload").addEventListener("click", async () => {
     });
 
     state.jobId = resp.job_id;
+    state.masks = {};
     $("#uploadText").textContent = `已上传 ${resp.file_count} 个文件。`;
     $("#uploadBar").style.width = "100%";
     toast("上传完成，正在加载配置…");
@@ -201,12 +208,19 @@ function currentOptions() {
   return out;
 }
 
-$("#btnPreview").addEventListener("click", async () => {
-  const body = {
+function buildOptionsBody() {
+  return {
     profile: state.profile,
     ...currentOptions(),
     salt: $("#saltInput").value.trim() || null,
   };
+}
+
+$("#btnPreview").addEventListener("click", async () => {
+  const body = buildOptionsBody();
+  // Masks are authored *on* the preview; re-running the tag preview keeps
+  // whatever rectangles were already drawn.
+  body.pixel_masks = serializePixelMasks();
   const btn = $("#btnPreview");
   btn.disabled = true; btn.textContent = "正在预览…";
   try {
@@ -324,7 +338,10 @@ function renderPreview(data) {
     processBtn.textContent = `残留标识门禁未通过（${data.gate.hit_count} 处命中）`;
   } else {
     processBtn.disabled = false;
-    processBtn.textContent = "执行匿名化并打包";
+    const n = maskCount();
+    processBtn.textContent = n
+      ? `执行匿名化并打包（含 ${n} 个像素遮罩）`
+      : "执行匿名化并打包";
   }
 
   // changes
@@ -362,6 +379,19 @@ function renderPreview(data) {
     <td><code>${escapeHtml(p.pseudonymous_id)}</code></td>
     <td>${p.day_offset ? `向过去 ${p.day_offset} 天` : "不适用"}</td>
   </tr>`).join("");
+
+  // pixel mask editor: reset selection, keep already-drawn masks keyed by
+  // file index (file order is stable across preview calls for one job).
+  maskEditor.fileIndex = null;
+  maskEditor.frame = 1;
+  maskEditor.selectedId = null;
+  maskEditor.previewMode = false;
+  state.lastMaskErrors = [];
+  $("#maskCanvas").classList.add("hidden");
+  $("#maskEmpty").classList.remove("hidden");
+  $("#maskApplyPreview").textContent = "生成遮罩预览";
+  renderMaskFileList();
+  renderMaskRectList();
 }
 
 function uidPair(oldV, newV) {
@@ -438,15 +468,608 @@ $$(".tab").forEach((tab) => tab.addEventListener("click", () => {
 $("#btnBack2").addEventListener("click", () => showCard("configCard"));
 
 // ---------------------------------------------------------------------------
+// Manual pixel masks ("人工像素遮罩")
+// ---------------------------------------------------------------------------
+
+const maskEditor = {
+  fileIndex: null,
+  frame: 1,
+  frameCount: 1,
+  origW: 0, origH: 0,       // original pixel dimensions
+  dispW: 0, dispH: 0,       // thumbnail dimensions on screen
+  scale: 1,                 // displayed px per original px (thumb/orig)
+  img: null,                // HTMLImageElement (base thumbnail)
+  selectedId: null,
+  // transient draw/move state
+  mode: null,               // "draw" | "move" | null
+  startX: 0, startY: 0,
+  draft: null,               // {x,y,width,height} in display coords
+  moveId: null, grabDX: 0, grabDY: 0,
+  previewMode: false,
+};
+
+const MASK_COLORS = ["#ff5d5d", "#ffb14e", "#f0e66b", "#5be08b",
+  "#52c7ff", "#9d8bff", "#ff8ad4", "#8be9d8", "#e09b6b", "#b8e36b"];
+
+function maskColor(id) {
+  const list = (state.masks[maskEditor.fileIndex] || []);
+  const idx = list.findIndex((m) => m.id === id);
+  return MASK_COLORS[Math.max(0, idx) % MASK_COLORS.length];
+}
+
+function basenamePath(p) {
+  const i = String(p || "").lastIndexOf("/");
+  return i >= 0 ? p.slice(i + 1) : p;
+}
+
+function renderMaskFileList() {
+  const data = state.preview;
+  const box = $("#maskFileList");
+  const unsupported = [];
+  const items = data.files.map((f) => {
+    const masks = state.masks[f.index] || [];
+    if (f.error) {
+      return `<div class="mask-file-item disabled" data-index="${f.index}">
+        <div class="path">${escapeHtml(basenamePath(f.source_path))}</div>
+        <div class="sub">${escapeHtml(f.source_path)} · 已跳过</div>
+      </div>`;
+    }
+    if (!f.maskable) {
+      unsupported.push(f);
+      return `<div class="mask-file-item disabled" data-index="${f.index}">
+        <div class="path">${escapeHtml(basenamePath(f.source_path))} 🔒</div>
+        <div class="sub">${escapeHtml(f.source_path)}</div>
+        <div class="lock">不可遮罩：${escapeHtml(f.mask_reason || "不支持的影像")}</div>
+      </div>`;
+    }
+    const dims = `${f.columns}×${f.rows}` +
+      (f.frame_count > 1 ? ` · ${f.frame_count} 帧` : "");
+    return `<div class="mask-file-item${f.index === maskEditor.fileIndex
+        ? " selected" : ""}" data-index="${f.index}">
+      <div class="path">${escapeHtml(basenamePath(f.source_path))}
+        ${masks.length ? `<span class="badge-count">${masks.length}</span>` : ""}
+      </div>
+      <div class="sub">${escapeHtml(f.source_path)} · ${escapeHtml(dims)}
+        · ${escapeHtml(f.photometric_interpretation || "")}</div>
+    </div>`;
+  }).join("");
+  box.innerHTML = items || `<div class="mask-empty">暂无可遮罩影像。</div>`;
+  $$("#maskFileList .mask-file-item").forEach((el) =>
+    el.addEventListener("click", () => {
+      const idx = Number(el.dataset.index);
+      const f = data.files[idx];
+      if (!f || f.error || !f.maskable) return;
+      selectMaskFile(idx);
+    }));
+
+  renderMaskWarnings();
+}
+
+function renderMaskWarnings() {
+  // Combines (a) files that cannot carry masks at all (from the preview
+  // payload) and (b) locatable errors returned by a blocked /process call.
+  const data = state.preview;
+  const unsupported = data
+    ? data.files.filter((f) => !f.error && !f.maskable)
+    : [];
+  const blocked = state.lastMaskErrors || [];
+  const warn = $("#maskUnsupported");
+  const parts = [];
+  if (blocked.length) {
+    parts.push(`<h4>⛔ ${blocked.length} 个遮罩错误（已阻止 ZIP 打包）</h4>
+      <ul>${blocked.map((e) => `<li>文件 #${e.file_index + 1}
+        （${escapeHtml(e.source_path)}）：${escapeHtml(e.reason)}</li>`)
+        .join("")}</ul>`);
+  }
+  if (unsupported.length) {
+    parts.push(`<h4>⚠ ${unsupported.length} 个影像无法人工遮罩（对其提交遮罩将阻止打包）</h4>
+      <ul>${unsupported.map((f) => `<li>#${f.index + 1}
+        ${escapeHtml(f.source_path)}：${escapeHtml(f.mask_reason || "")}</li>`)
+        .join("")}</ul>`);
+  }
+  if (!parts.length) {
+    warn.classList.add("hidden");
+    warn.innerHTML = "";
+    return;
+  }
+  warn.classList.remove("hidden");
+  warn.className = "warnings " + (blocked.length ? "" : "");
+  warn.innerHTML = parts.join("");
+}
+
+async function selectMaskFile(fileIndex) {
+  maskEditor.fileIndex = fileIndex;
+  maskEditor.selectedId = null;
+  maskEditor.previewMode = false;
+  const f = state.preview.files[fileIndex];
+  maskEditor.frame = 1;
+  maskEditor.frameCount = f.frame_count || 1;
+  renderMaskFileList();
+  await loadMaskThumbnail();
+  renderMaskRectList();
+}
+
+function setMaskError(msg) {
+  const el = $("#maskError");
+  if (!msg) { el.classList.add("hidden"); el.textContent = ""; return; }
+  el.classList.remove("hidden");
+  el.textContent = msg;
+}
+
+async function loadMaskThumbnail(frame = 1) {
+  const idx = maskEditor.fileIndex;
+  const canvas = $("#maskCanvas");
+  // Loading a fresh base thumbnail always exits the applied-mask preview.
+  maskEditor.previewMode = false;
+  $("#maskApplyPreview").textContent = "生成遮罩预览";
+  $("#maskEmpty").classList.add("hidden");
+  $("#maskLoading").classList.remove("hidden");
+  setMaskError("");
+  try {
+    const resp = await fetch(
+      `/api/jobs/${state.jobId}/files/${idx}/thumbnail?frame=${frame}`,
+      { cache: "no-store" });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      const msg = typeof detail === "string" ? detail
+        : (detail?.message || `缩略图加载失败（HTTP ${resp.status}）`);
+      throw new Error(msg);
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error("缩略图解码失败。"));
+      img.src = url;
+    });
+    maskEditor.img = img;
+    // Original dimensions come from response headers; fall back to the
+    // files payload when a header is missing.
+    const f = state.preview.files[idx];
+    maskEditor.origW = Number(resp.headers.get("X-Dicom-Columns")) || f.columns;
+    maskEditor.origH = Number(resp.headers.get("X-Dicom-Rows")) || f.rows;
+    maskEditor.frameCount = Number(resp.headers.get("X-Dicom-Frames"))
+      || f.frame_count || 1;
+    maskEditor.dispW = img.naturalWidth;
+    maskEditor.dispH = img.naturalHeight;
+    maskEditor.scale = maskEditor.dispW / maskEditor.origW;
+    canvas.width = maskEditor.dispW;
+    canvas.height = maskEditor.dispH;
+    canvas.classList.remove("hidden");
+    $("#maskLoading").classList.add("hidden");
+    updateFrameControls();
+    drawMaskCanvas();
+  } catch (err) {
+    $("#maskLoading").classList.add("hidden");
+    canvas.classList.add("hidden");
+    setMaskError(err.message);
+  }
+}
+
+function updateFrameControls() {
+  const ctl = $("#maskFrameCtl");
+  ctl.classList.toggle("hidden", maskEditor.frameCount <= 1);
+  $("#maskFrameTotal").textContent = String(maskEditor.frameCount);
+  $("#maskFrameInput").value = String(maskEditor.frame);
+  $("#maskFrameInput").max = String(maskEditor.frameCount);
+  $("#maskMeta").textContent =
+    `原始尺寸 ${maskEditor.origW}×${maskEditor.origH}px · ` +
+    `缩略图 ${maskEditor.dispW}×${maskEditor.dispH}px · 比例 ` +
+    `${maskEditor.scale.toFixed(3)}`;
+}
+
+// -- coordinate helpers ------------------------------------------------------
+
+function eventToDisplay(e) {
+  const rect = $("#maskCanvas").getBoundingClientRect();
+  // canvas may be CSS-scaled to fit; map back to its bitmap space
+  const x = (e.clientX - rect.left) *
+    ($("#maskCanvas").width / rect.width);
+  const y = (e.clientY - rect.top) *
+    ($("#maskCanvas").height / rect.height);
+  return {
+    x: Math.max(0, Math.min(maskEditor.dispW, x)),
+    y: Math.max(0, Math.min(maskEditor.dispH, y)),
+  };
+}
+
+function dispRect(m) {
+  // Stored rectangles are in *original* pixel coordinates.
+  return {
+    x: m.rect.x * maskEditor.scale,
+    y: m.rect.y * maskEditor.scale,
+    width: m.rect.width * maskEditor.scale,
+    height: m.rect.height * maskEditor.scale,
+  };
+}
+
+function visibleOnFrame(m) {
+  return m.scope === "all" || m.frame === maskEditor.frame;
+}
+
+function drawMaskCanvas() {
+  const canvas = $("#maskCanvas");
+  if (!canvas.width) return;
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (maskEditor.img) ctx.drawImage(maskEditor.img, 0, 0);
+  const list = state.masks[maskEditor.fileIndex] || [];
+
+  for (const m of list) {
+    if (!visibleOnFrame(m)) continue;
+    const r = dispRect(m);
+    const onCurrent = m.scope === "all" || m.frame === maskEditor.frame;
+    const color = m.scope === "all" ? "#52c7ff" : maskColor(m.id);
+    ctx.save();
+    ctx.globalAlpha = m.id === maskEditor.selectedId ? 0.55 : 0.35;
+    ctx.fillStyle = color;
+    ctx.fillRect(r.x, r.y, r.width, r.height);
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = m.id === maskEditor.selectedId ? 2.5 : 1.5;
+    ctx.strokeStyle = color;
+    if (!onCurrent) ctx.setLineDash([4, 3]);
+    ctx.strokeRect(r.x + 0.5, r.y + 0.5, r.width - 1, r.height - 1);
+    ctx.setLineDash([]);
+    // label pill
+    const label = m.scope === "all" ? `#${m.id} 全部帧` : `#${m.id}`;
+    ctx.font = "11px sans-serif";
+    const tw = ctx.measureText(label).width + 8;
+    ctx.fillStyle = color;
+    ctx.fillRect(r.x, Math.max(0, r.y - 14), tw, 14);
+    ctx.fillStyle = "#0b1020";
+    ctx.fillText(label, r.x + 4, Math.max(11, r.y - 3));
+    ctx.restore();
+  }
+
+  if (maskEditor.draft) {
+    const d = maskEditor.draft;
+    ctx.save();
+    ctx.globalAlpha = 0.35;
+    ctx.fillStyle = "#ff5d5d";
+    ctx.fillRect(d.x, d.y, d.width, d.height);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = "#ff5d5d";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(d.x + 0.5, d.y + 0.5, d.width - 1, d.height - 1);
+    ctx.restore();
+  }
+}
+
+function hitTest(p) {
+  const list = (state.masks[maskEditor.fileIndex] || [])
+    .filter(visibleOnFrame);
+  // topmost last drawn -> reverse
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    const r = dispRect(m);
+    if (p.x >= r.x && p.x <= r.x + r.width && p.y >= r.y && p.y <= r.y + r.height) {
+      return m;
+    }
+  }
+  return null;
+}
+
+let maskSeq = 0;
+function addMask(origRect) {
+  const idx = maskEditor.fileIndex;
+  const scope = $("#maskScope").value;
+  state.masks[idx] = state.masks[idx] || [];
+  state.masks[idx].push({
+    id: ++maskSeq,
+    scope,
+    frame: maskEditor.frame,
+    rect: origRect,
+  });
+}
+
+$("#maskCanvas").addEventListener("mousedown", (e) => {
+  if (maskEditor.previewMode || !maskEditor.img) return;
+  const p = eventToDisplay(e);
+  const hit = hitTest(p);
+  if (hit) {
+    maskEditor.mode = "move";
+    maskEditor.moveId = hit.id;
+    maskEditor.selectedId = hit.id;
+    const r = dispRect(hit);
+    maskEditor.grabDX = p.x - r.x;
+    maskEditor.grabDY = p.y - r.y;
+  } else {
+    maskEditor.mode = "draw";
+    maskEditor.startX = p.x; maskEditor.startY = p.y;
+    maskEditor.selectedId = null;
+    maskEditor.draft = { x: p.x, y: p.y, width: 0, height: 0 };
+  }
+  renderMaskRectList();
+  drawMaskCanvas();
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!maskEditor.mode || maskEditor.fileIndex === null) return;
+  const p = eventToDisplay(e);
+  if (maskEditor.mode === "draw") {
+    maskEditor.draft = {
+      x: Math.min(maskEditor.startX, p.x),
+      y: Math.min(maskEditor.startY, p.y),
+      width: Math.abs(p.x - maskEditor.startX),
+      height: Math.abs(p.y - maskEditor.startY),
+    };
+    drawMaskCanvas();
+  } else if (maskEditor.mode === "move") {
+    const list = state.masks[maskEditor.fileIndex] || [];
+    const m = list.find((x) => x.id === maskEditor.moveId);
+    if (!m) return;
+    const r = dispRect(m);
+    let nx = p.x - maskEditor.grabDX;
+    let ny = p.y - maskEditor.grabDY;
+    nx = Math.max(0, Math.min(maskEditor.dispW - r.width, nx));
+    ny = Math.max(0, Math.min(maskEditor.dispH - r.height, ny));
+    // commit in original coordinates (rounded to whole pixels)
+    m.rect.x = Math.round(nx / maskEditor.scale);
+    m.rect.y = Math.round(ny / maskEditor.scale);
+    clampMaskToImage(m);
+    drawMaskCanvas();
+  }
+});
+
+window.addEventListener("mouseup", () => {
+  if (!maskEditor.mode) return;
+  if (maskEditor.mode === "draw" && maskEditor.draft) {
+    const d = maskEditor.draft;
+    if (d.width >= 3 && d.height >= 3) {
+      // convert to original pixels
+      const x = Math.max(0, Math.floor(d.x / maskEditor.scale));
+      const y = Math.max(0, Math.floor(d.y / maskEditor.scale));
+      const x2 = Math.min(maskEditor.origW,
+        Math.ceil((d.x + d.width) / maskEditor.scale));
+      const y2 = Math.min(maskEditor.origH,
+        Math.ceil((d.y + d.height) / maskEditor.scale));
+      if (x2 - x > 0 && y2 - y > 0) {
+        addMask({ x, y, width: x2 - x, height: y2 - y });
+      }
+    }
+    maskEditor.draft = null;
+    renderMaskFileList();
+  }
+  maskEditor.mode = null;
+  maskEditor.moveId = null;
+  renderMaskRectList();
+  drawMaskCanvas();
+});
+
+function clampMaskToImage(m) {
+  m.rect.x = Math.max(0, Math.min(maskEditor.origW - 1, m.rect.x));
+  m.rect.y = Math.max(0, Math.min(maskEditor.origH - 1, m.rect.y));
+  m.rect.width = Math.min(m.rect.width, maskEditor.origW - m.rect.x);
+  m.rect.height = Math.min(m.rect.height, maskEditor.origH - m.rect.y);
+}
+
+function deleteMask(id) {
+  const idx = maskEditor.fileIndex;
+  state.masks[idx] = (state.masks[idx] || []).filter((m) => m.id !== id);
+  if (maskEditor.selectedId === id) maskEditor.selectedId = null;
+  // Any edit invalidates the applied-mask preview image.
+  if (maskEditor.previewMode) {
+    loadMaskThumbnail(maskEditor.frame);
+  } else {
+    drawMaskCanvas();
+  }
+  renderMaskFileList();
+  renderMaskRectList();
+}
+
+function renderMaskRectList() {
+  const box = $("#maskRectList");
+  if (maskEditor.fileIndex === null) { box.innerHTML = ""; return; }
+  const list = state.masks[maskEditor.fileIndex] || [];
+  if (!list.length) {
+    box.innerHTML = `<div class="muted" style="font-size:12.5px">
+      在影像上拖动画布绘制第一个矩形遮罩。</div>`;
+    $("#maskDelete").disabled = true;
+    return;
+  }
+  box.innerHTML = list.map((m) => {
+    const onFrame = visibleOnFrame(m);
+    const range = m.scope === "all"
+      ? `<span class="mask-rect-range">全部帧</span>`
+      : `<span class="mask-rect-range${m.frame === maskEditor.frame
+        ? " current" : ""}">帧 ${m.frame}</span>`;
+    return `<div class="mask-rect-row${m.id === maskEditor.selectedId
+        ? " active" : ""}" data-id="${m.id}" style="${onFrame ? ""
+        : "opacity:.55"}">
+      <span class="swatch" style="background:${m.scope === "all"
+        ? "#52c7ff" : maskColor(m.id)}"></span>
+      <span class="desc">#${m.id} · 原始坐标 (${m.rect.x}, ${m.rect.y})
+        ${m.rect.width}×${m.rect.height}px</span>
+      ${range}
+      <button type="button" data-del="${m.id}">删除</button>
+    </div>`;
+  }).join("");
+  $$("#maskRectList [data-del]").forEach((b) =>
+    b.addEventListener("click", () => deleteMask(Number(b.dataset.del))));
+  $$("#maskRectList .mask-rect-row").forEach((row) =>
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      const m = (state.masks[maskEditor.fileIndex] || [])
+        .find((x) => x.id === Number(row.dataset.id));
+      if (!m) return;
+      maskEditor.selectedId = m.id;
+      if (m.scope === "frame") {
+        maskEditor.frame = m.frame;
+        loadMaskThumbnail(m.frame);
+      }
+      renderMaskRectList();
+      drawMaskCanvas();
+    }));
+  $("#maskDelete").disabled = maskEditor.selectedId === null;
+}
+
+$("#maskDelete").addEventListener("click", () => {
+  if (maskEditor.selectedId !== null) deleteMask(maskEditor.selectedId);
+});
+$("#maskClear").addEventListener("click", () => {
+  if (maskEditor.fileIndex === null) return;
+  if (!(state.masks[maskEditor.fileIndex] || []).length) return;
+  if (!confirm("清空当前文件的全部矩形遮罩？")) return;
+  state.masks[maskEditor.fileIndex] = [];
+  maskEditor.selectedId = null;
+  renderMaskFileList();
+  renderMaskRectList();
+  if (maskEditor.previewMode) {
+    loadMaskThumbnail(maskEditor.frame);
+  } else {
+    drawMaskCanvas();
+  }
+});
+window.addEventListener("keydown", (e) => {
+  if (maskEditor.fileIndex === null) return;
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  if ((e.key === "Delete" || e.key === "Backspace")
+      && maskEditor.selectedId !== null) {
+    e.preventDefault();
+    deleteMask(maskEditor.selectedId);
+  }
+});
+
+$("#maskFramePrev").addEventListener("click", () => changeMaskFrame(-1));
+$("#maskFrameNext").addEventListener("click", () => changeMaskFrame(1));
+$("#maskFrameInput").addEventListener("change", () => {
+  const v = Math.max(1, Math.min(maskEditor.frameCount,
+    Number($("#maskFrameInput").value) || 1));
+  if (v !== maskEditor.frame) {
+    maskEditor.frame = v;
+    loadMaskThumbnail(v);
+    renderMaskRectList();
+  }
+});
+
+function changeMaskFrame(delta) {
+  const v = Math.max(1, Math.min(maskEditor.frameCount,
+    maskEditor.frame + delta));
+  if (v === maskEditor.frame) return;
+  maskEditor.frame = v;
+  loadMaskThumbnail(v);
+  renderMaskRectList();
+}
+
+// -- serialize masks into the API payload -----------------------------------
+
+function serializePixelMasks() {
+  const out = [];
+  for (const [idxStr, list] of Object.entries(state.masks)) {
+    if (!list || !list.length) continue;
+    const groups = [];
+    // all-frames group + per-frame groups
+    const allRects = list.filter((m) => m.scope === "all");
+    if (allRects.length) {
+      groups.push({
+        all_frames: true,
+        rectangles: allRects.map((m) => ({ x: m.rect.x, y: m.rect.y, width: m.rect.width, height: m.rect.height })),
+      });
+    }
+    const byFrame = new Map();
+    for (const m of list.filter((x) => x.scope === "frame")) {
+      if (!byFrame.has(m.frame)) byFrame.set(m.frame, []);
+      byFrame.get(m.frame).push(m.rect);
+    }
+    for (const [frame, rects] of byFrame.entries()) {
+      groups.push({
+        all_frames: false,
+        frame_start: frame,
+        frame_end: frame,
+        rectangles: rects.map((r) => ({ ...r })),
+      });
+    }
+    out.push({ file_index: Number(idxStr), groups });
+  }
+  return out;
+}
+
+function renderMaskErrors(entries) {
+  state.lastMaskErrors = entries || [];
+  renderMaskWarnings();
+}
+
+function maskCount() {
+  return Object.values(state.masks)
+    .reduce((n, list) => n + (list ? list.length : 0), 0);
+}
+
+$("#maskApplyPreview").addEventListener("click", async () => {
+  const idx = maskEditor.fileIndex;
+  if (idx === null) return;
+  const btn = $("#maskApplyPreview");
+  // In preview mode the button returns to the editable thumbnail.
+  if (maskEditor.previewMode) {
+    maskEditor.previewMode = false;
+    btn.textContent = "生成遮罩预览";
+    btn.disabled = false;
+    await loadMaskThumbnail(maskEditor.frame);
+    renderMaskRectList();
+    return;
+  }
+  const payload = buildOptionsBody();
+  payload.frame = maskEditor.frame;
+  payload.pixel_masks = serializePixelMasks()
+    .filter((m) => m.file_index === idx);
+  btn.disabled = true; btn.textContent = "生成中…";
+  setMaskError("");
+  try {
+    const resp = await fetch(
+      `/api/jobs/${state.jobId}/files/${idx}/mask-preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      const detail = data.detail;
+      let msg;
+      if (typeof detail === "string") msg = detail;
+      else if (detail?.pixel_mask_errors) {
+        msg = detail.pixel_mask_errors
+          .map((e) => `文件 #${e.file_index + 1}（${e.source_path}）：${e.reason}`)
+          .join("\n");
+      } else msg = detail?.message || `遮罩预览失败（HTTP ${resp.status}）`;
+      throw new Error(msg);
+    }
+    const data = await resp.json();
+    const img = new Image();
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error("预览图解码失败。"));
+      img.src = "data:image/png;base64," + data.image_png_base64;
+    });
+    maskEditor.img = img;
+    maskEditor.dispW = data.image_width;
+    maskEditor.dispH = data.image_height;
+    maskEditor.origW = data.columns;
+    maskEditor.origH = data.rows;
+    maskEditor.scale = maskEditor.dispW / maskEditor.origW;
+    const canvas = $("#maskCanvas");
+    canvas.width = maskEditor.dispW;
+    canvas.height = maskEditor.dispH;
+    maskEditor.previewMode = true;
+    drawMaskCanvas();
+    toast(`遮罩预览：帧 ${data.frame}/${data.frame_count}，` +
+      `${data.rectangle_count} 个矩形（执行后效果）。`);
+    btn.textContent = "返回编辑";
+    btn.disabled = false;
+  } catch (err) {
+    setMaskError(err.message);
+    toast(err.message.split("\n")[0], true);
+    btn.disabled = false; btn.textContent = "生成遮罩预览";
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Process & download
 // ---------------------------------------------------------------------------
 
 $("#btnProcess").addEventListener("click", async () => {
-  const body = {
-    profile: state.profile,
-    ...currentOptions(),
-    salt: $("#saltInput").value.trim() || null,
-  };
+  const body = buildOptionsBody();
+  body.pixel_masks = serializePixelMasks();
   const btn = $("#btnProcess");
   btn.disabled = true; btn.textContent = "正在执行匿名化（可能需要一些时间）…";
   try {
@@ -457,6 +1080,19 @@ $("#btnProcess").addEventListener("click", async () => {
     });
     const data = await resp.json();
     if (!resp.ok) {
+      // 422: pixel masks cannot be applied (compressed syntax / undecodable
+      // pixels / invalid rectangle) -- packaging was blocked.  Show the
+      // locatable per-file errors on the mask tab.
+      if (resp.status === 422 && data.detail?.pixel_mask_errors) {
+        renderMaskErrors(data.detail.pixel_mask_errors);
+        $$(".tab").forEach((t) =>
+          t.classList.toggle("active", t.dataset.tab === "masks"));
+        $$(".tabpane").forEach((p) =>
+          p.classList.toggle("hidden", p.id !== "tab-masks"));
+        toast("像素遮罩阻止了打包，请按提示修正。", true);
+        btn.disabled = false; btn.textContent = "执行匿名化并打包";
+        return;
+      }
       // 409: residual identifier gate blocked ZIP generation -- show the
       // hit table on the preview page instead of a plain toast.
       if (resp.status === 409 && data.detail?.residue_identifier_gate) {
@@ -514,6 +1150,7 @@ function finishJob(data) {
 $("#btnStartOver").addEventListener("click", () => {
   state.jobId = null;
   state.preview = null;
+  state.masks = {};
   state.selectedFiles = [];
   $("#fileInput").value = "";
   $("#dirInput").value = "";

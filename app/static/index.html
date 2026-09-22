@@ -87,6 +87,7 @@
     <div class="tabs">
       <button class="tab active" data-tab="changes">逐字段变更</button>
       <button class="tab" data-tab="files">影像文件 / UID 映射</button>
+      <button class="tab" data-tab="masks">人工像素遮罩</button>
       <button class="tab" data-tab="patients">患者伪名</button>
     </div>
 
@@ -125,6 +126,46 @@
           </tr></thead>
           <tbody id="filesBody"></tbody>
         </table>
+      </div>
+    </div>
+
+    <div id="tab-masks" class="tabpane hidden">
+      <p class="hint">在<strong>输出影像</strong>（元数据已匿名化）上绘制矩形遮罩：拖动绘制、拖动矩形内部移动、选中后按 <code>Delete</code> 或点击「删除选中」移除。坐标会按缩略图缩放比例换算为<strong>原始像素坐标</strong>提交；遮罩区域在执行时以与影像光度解释匹配的安全背景色填充，多帧尺寸、窗宽窗位与 PhotometricInterpretation 保持不变。</p>
+      <div id="maskUnsupported" class="warnings hidden"></div>
+      <div class="mask-layout">
+        <div class="mask-files">
+          <h4>输出影像</h4>
+          <div id="maskFileList" class="mask-file-list"></div>
+        </div>
+        <div class="mask-editor">
+          <div class="mask-toolbar">
+            <div id="maskFrameCtl" class="mask-frame-ctl hidden">
+              <label>帧</label>
+              <button type="button" id="maskFramePrev" class="btn small">‹</button>
+              <input type="number" id="maskFrameInput" min="1" value="1">
+              <span>/ <span id="maskFrameTotal">1</span></span>
+              <button type="button" id="maskFrameNext" class="btn small">›</button>
+            </div>
+            <div class="mask-scope">
+              <label>新矩形作用于：</label>
+              <select id="maskScope">
+                <option value="frame" selected>仅当前帧</option>
+                <option value="all">全部帧</option>
+              </select>
+            </div>
+            <button type="button" id="maskDelete" class="btn small" disabled>删除选中</button>
+            <button type="button" id="maskClear" class="btn small">清空本文件</button>
+            <button type="button" id="maskApplyPreview" class="btn small primary">生成遮罩预览</button>
+            <span id="maskMeta" class="muted"></span>
+          </div>
+          <div id="maskStage" class="mask-stage">
+            <div id="maskEmpty" class="mask-empty">请从左侧选择一张可遮罩的输出影像。</div>
+            <canvas id="maskCanvas" class="hidden"></canvas>
+            <div id="maskLoading" class="mask-loading hidden">正在加载缩略图…</div>
+            <div id="maskError" class="mask-error hidden"></div>
+          </div>
+          <div id="maskRectList" class="mask-rect-list"></div>
+        </div>
       </div>
     </div>
 

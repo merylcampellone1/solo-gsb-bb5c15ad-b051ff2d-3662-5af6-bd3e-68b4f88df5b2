@@ -8,6 +8,32 @@ from pydantic import BaseModel, Field
 from .dicom_catalog import OPTION_KEYS
 
 
+class MaskRectangle(BaseModel):
+    # Coordinates in *original* pixels (the front end converts thumbnail
+    # coordinates back using the scale factor).
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
+class MaskGroup(BaseModel):
+    """Rectangles sharing one frame scope on one file.
+
+    ``all_frames=True`` applies every rectangle to every frame; otherwise the
+    1-based inclusive ``frame_start``/``frame_end`` span is used.
+    """
+    all_frames: bool = False
+    frame_start: int | None = Field(default=None, ge=1)
+    frame_end: int | None = Field(default=None, ge=1)
+    rectangles: list[MaskRectangle] = Field(default_factory=list)
+
+
+class FilePixelMasks(BaseModel):
+    file_index: int = Field(ge=0)
+    groups: list[MaskGroup] = Field(default_factory=list)
+
+
 class AnonymizationOptions(BaseModel):
     profile: str = "recommended"
     # ``None`` means "follow the profile preset"; explicit booleans override.
@@ -19,6 +45,8 @@ class AnonymizationOptions(BaseModel):
     keep_protocol: bool | None = None
     keep_descriptions: bool | None = None
     strip_overlays: bool | None = None
+    # Manual rectangular pixel masks, keyed by uploaded file index.
+    pixel_masks: list[FilePixelMasks] = Field(default_factory=list)
     salt: Optional[str] = Field(
         default=None,
         description="可选自定义盐值；留空使用服务器默认盐值。盐值决定伪名与新 UID。",
@@ -27,6 +55,22 @@ class AnonymizationOptions(BaseModel):
     def overrides(self) -> dict[str, bool]:
         return {k: bool(getattr(self, k)) for k in OPTION_KEYS
                 if getattr(self, k) is not None}
+
+
+class MaskPreviewRequest(BaseModel):
+    """Body for the pixel-mask preview endpoint (options + which frame)."""
+    profile: str = "recommended"
+    keep_dates: bool | None = None
+    keep_chars: bool | None = None
+    keep_staff: bool | None = None
+    keep_site: bool | None = None
+    keep_device: bool | None = None
+    keep_protocol: bool | None = None
+    keep_descriptions: bool | None = None
+    strip_overlays: bool | None = None
+    pixel_masks: list[FilePixelMasks] = Field(default_factory=list)
+    salt: str | None = None
+    frame: int = Field(default=1, ge=1)
 
 
 class FieldChange(BaseModel):
@@ -82,6 +126,16 @@ class FileResult(BaseModel):
     new_series_uid: str | None = None
     new_sop_uid: str | None = None
     error: str | None = None
+    # manual pixel-mask capability / outcome
+    maskable: bool | None = None
+    mask_reason: str | None = None
+    rows: int | None = None
+    columns: int | None = None
+    frame_count: int | None = None
+    photometric_interpretation: str | None = None
+    mask_error: str | None = None
+    mask_rectangles: int | None = None
+    mask_frames: str | None = None
 
 
 class PreviewResponse(BaseModel):
@@ -94,6 +148,8 @@ class PreviewResponse(BaseModel):
     counts: dict[str, int]
     patients: list[dict[str, str]]
     gate: GateResult | None = None
+    pixel_masks: dict | None = None
+    mask_errors: list[dict] = []
 
 
 class ProcessResponse(BaseModel):
@@ -105,3 +161,4 @@ class ProcessResponse(BaseModel):
     warnings: list[str]
     counts: dict[str, int]
     gate: GateResult | None = None
+    pixel_masks: dict | None = None

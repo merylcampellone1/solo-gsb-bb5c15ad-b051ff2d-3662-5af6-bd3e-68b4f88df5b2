@@ -12,10 +12,11 @@ from pathlib import Path
 
 from pydicom.dataset import Dataset
 
-from . import config
+from . import config, pixel_masks
 from .anonymizer import Anonymizer, FileInfo
 from .dicom_catalog import PROFILES
 from .residue_gate import GateBlocked, IdentifierGate
+from .schemas import FilePixelMasks
 
 
 def _safe_relpath(name: str) -> str:
@@ -136,7 +137,8 @@ def _build_file_infos(job: Job) -> list[FileInfo]:
 
 def _build_report(profile_name: str, options: dict[str, bool],
                   anon: Anonymizer, infos: list[FileInfo],
-                  warnings: list[str], gate_summary: dict | None
+                  warnings: list[str], gate_summary: dict | None,
+                  mask_section: dict | None
                   ) -> dict:
     valid = [fi for fi in infos if fi.output_path]
     report = {
@@ -168,6 +170,10 @@ def _build_report(profile_name: str, options: dict[str, bool],
             for fi in infos if not fi.output_path
         ],
     }
+    # The pixel-mask section is deliberately coordinate-free: only file
+    # paths, frame scopes and rectangle counts are ever written to disk.
+    if mask_section is not None:
+        report["pixel_masks"] = mask_section
     if gate_summary is not None:
         report["residue_identifier_gate"] = gate_summary
     return report
@@ -203,7 +209,8 @@ def _run_gate(anon: Anonymizer, infos: list[FileInfo],
 
 
 def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
-        write: bool) -> dict:
+        write: bool,
+        pixel_masks_payload: list[FilePixelMasks] | None = None) -> dict:
     """Execute a preview (write=False) or a full anonymisation run."""
     with job.lock:
         job.error = None
@@ -223,6 +230,10 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
         anon = Anonymizer(options=options, salt=salt)
 
         anon.prescan(infos, lambda fi: job.sources[fi.index])
+
+        # Validate the pixel-mask request against per-file geometry and
+        # attach ready-to-apply fragments before any dataset is rewritten.
+        mask_errors = _attach_masks(infos, pixel_masks_payload or [])
 
         out_root = job.upload_dir.parent / "out"
         if write:
@@ -245,6 +256,17 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
             else:
                 anon.counts["skipped"] += 1
 
+        # Errors surfaced while applying masks inside the engine are also
+        # collected (the geometry probe cannot catch corrupt PixelData).
+        for fi in infos:
+            if fi.mask_error and not any(
+                    e["file_index"] == fi.index for e in mask_errors):
+                mask_errors.append({
+                    "file_index": fi.index,
+                    "source_path": fi.source_path,
+                    "reason": fi.mask_error,
+                })
+
         warnings = list(anon.global_warnings)
         for fi in infos:
             for w in fi.warnings:
@@ -253,6 +275,19 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
                     warnings.append(msg)
 
         valid = [fi for fi in infos if fi.output_path]
+
+        mask_section = _mask_section(infos)
+
+        # Pixel masks that cannot be applied must stop packaging and surface
+        # locatable per-file errors (compressed syntax / undecodable pixels /
+        # invalid rectangle).  Checked before the "no output" guard so a
+        # single masked file that fails yields 422 rather than a generic 400.
+        # Preview mode still returns a usable payload with per-file errors.
+        if mask_errors and write:
+            job.status = "error"
+            job.error = str(pixel_masks.MaskBlocked(mask_errors))
+            raise pixel_masks.MaskBlocked(mask_errors)
+
         if not valid:
             # Report writing/blocking is irrelevant without any output, but
             # preview still needs the payload for per-file error display.
@@ -265,7 +300,8 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
         # very JSON text the user receives, so a leak inside the report is
         # caught rather than self-certified.
         report = _build_report(profile_name, options, anon, infos,
-                               warnings, gate_summary=None)
+                               warnings, gate_summary=None,
+                               mask_section=mask_section)
         report_text = json.dumps(report, ensure_ascii=False, indent=2)
 
         gate_result = _run_gate(anon, infos, in_memory,
@@ -317,6 +353,8 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
             "uid_map": anon.uid_map,
             "profile": profile_name,
             "gate": gate_dict,
+            "mask_errors": mask_errors,
+            "pixel_masks": mask_section,
         }
         if not write:
             job.last_preview = payload
@@ -324,6 +362,81 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
         else:
             job.last_result = payload
         return payload
+
+
+def _attach_masks(infos: list[FileInfo],
+                  payload: list) -> list[dict]:
+    """Translate API mask payloads into per-FileInfo fragments.
+
+    Returns a list of locatable errors (empty == all accepted).  Frame-range
+    and rectangle validation happen here where geometry is known.
+    """
+    errors: list[dict] = []
+    by_index = {fi.index: fi for fi in infos}
+    for item in payload:
+        fi = by_index.get(item.file_index)
+        if fi is None:
+            errors.append({
+                "file_index": item.file_index,
+                "source_path": f"#{item.file_index + 1}",
+                "reason": "文件序号不存在。",
+            })
+            continue
+        if not fi.is_dicom:
+            errors.append({
+                "file_index": fi.index,
+                "source_path": fi.source_path,
+                "reason": fi.error or "不是可匿名化的 DICOM 文件。",
+            })
+            continue
+        if not fi.maskable:
+            errors.append({
+                "file_index": fi.index,
+                "source_path": fi.source_path,
+                "reason": fi.mask_reason or "该影像不支持像素遮罩。",
+            })
+            continue
+        if not item.groups:
+            continue
+        try:
+            fragments, _rects, _frames = pixel_masks.build_frames(
+                item.groups, fi.frame_count or 1)
+        except pixel_masks.MaskValidationError as exc:
+            errors.append({
+                "file_index": fi.index,
+                "source_path": fi.source_path,
+                "reason": str(exc),
+            })
+            continue
+        if fragments:
+            fi.mask_fragments = (fi.mask_fragments or []) + fragments
+    return errors
+
+
+def _mask_section(infos: list[FileInfo]) -> dict:
+    """Coordinate-free report/API section: paths + frame scopes + counts."""
+    files: list[dict] = []
+    total = 0
+    for fi in infos:
+        if not fi.mask_fragments:
+            continue
+        total += 1
+        frame_indices: set[int] = set()
+        for fragment in fi.mask_fragments:
+            start, stop = fragment["range"].indices()
+            frame_indices.update(range(start, stop))
+        # Report "all" when the union of frame scopes covers every frame,
+        # regardless of whether the user picked "all frames" or listed them.
+        covers_all = frame_indices == set(range(fi.frame_count or 0))
+        frames = "all" if covers_all else pixel_masks._compress_frame_list(
+            sorted(i + 1 for i in frame_indices))
+        files.append({
+            "source_relative_path": fi.source_path,
+            "output_path": fi.output_path,
+            "frame_range": frames,
+            "rectangle_count": len(fi.mask_fragments),
+        })
+    return {"masked_file_count": total, "files": files}
 
 
 def _file_payload(fi: FileInfo) -> dict:
@@ -345,4 +458,14 @@ def _file_payload(fi: FileInfo) -> dict:
         "new_series_uid": fi.new_series_uid,
         "new_sop_uid": fi.new_sop_uid,
         "error": fi.error,
+        "maskable": fi.maskable if fi.is_dicom else None,
+        "mask_reason": fi.mask_reason,
+        "rows": fi.rows,
+        "columns": fi.columns,
+        "frame_count": fi.frame_count,
+        "photometric_interpretation": fi.photometric,
+        "mask_error": fi.mask_error,
+        "mask_rectangles": (len(fi.mask_fragments)
+                            if fi.mask_fragments else 0),
+        "mask_frames": (fi.mask_summary or {}).get("frames"),
     }
