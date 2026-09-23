@@ -3,9 +3,33 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .dicom_catalog import OPTION_KEYS
+
+
+class MaskRectangle(BaseModel):
+    # Coordinates are original (unscaled) pixels; bounds are half-open.
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+
+
+class PixelMaskGroup(BaseModel):
+    file_index: int = Field(ge=0)
+    rectangles: list[MaskRectangle] = Field(min_length=1)
+    # 0-based, inclusive frame range; null end means "through the last frame".
+    frame_start: int = Field(default=0, ge=0)
+    frame_end: int | None = Field(default=None, ge=0)
+
+    @field_validator("frame_end")
+    @classmethod
+    def _end_after_start(cls, value, info):
+        start = info.data.get("frame_start", 0)
+        if value is not None and value < start:
+            raise ValueError("frame_end 不能小于 frame_start")
+        return value
 
 
 class AnonymizationOptions(BaseModel):
@@ -19,6 +43,8 @@ class AnonymizationOptions(BaseModel):
     keep_protocol: bool | None = None
     keep_descriptions: bool | None = None
     strip_overlays: bool | None = None
+    # Manual rectangular pixel masks, keyed by uploaded file index.
+    pixel_masks: list[PixelMaskGroup] = Field(default_factory=list)
     salt: Optional[str] = Field(
         default=None,
         description="可选自定义盐值；留空使用服务器默认盐值。盐值决定伪名与新 UID。",
@@ -105,3 +131,15 @@ class ProcessResponse(BaseModel):
     warnings: list[str]
     counts: dict[str, int]
     gate: GateResult | None = None
+    pixel_masks: list[dict] = []
+
+
+class ThumbnailRequest(BaseModel):
+    file_index: int = Field(ge=0)
+    frame: int = Field(default=0, ge=0)
+
+
+class MaskPreviewRequest(BaseModel):
+    file_index: int = Field(ge=0)
+    frame: int = Field(default=0, ge=0)
+    rectangles: list[MaskRectangle] = Field(default_factory=list)

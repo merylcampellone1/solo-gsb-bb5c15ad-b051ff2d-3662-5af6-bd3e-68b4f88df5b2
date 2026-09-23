@@ -9,6 +9,9 @@ const state = {
   page: 0,
   pageSize: 50,
   filteredChanges: [],
+  masks: {},   // fileIndex -> { frame: 0-based, rects: [{id,x,y,w,h,scope}] }
+  maskActiveFile: null,
+  maskSelectedId: null,
 };
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
@@ -206,6 +209,7 @@ $("#btnPreview").addEventListener("click", async () => {
     profile: state.profile,
     ...currentOptions(),
     salt: $("#saltInput").value.trim() || null,
+    pixel_masks: buildMaskGroups(),
   };
   const btn = $("#btnPreview");
   btn.disabled = true; btn.textContent = "正在预览…";
@@ -215,12 +219,27 @@ $("#btnPreview").addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!resp.ok) throw new Error((await resp.json()).detail || "预览失败");
-    state.preview = await resp.json();
+    const data = await resp.json();
+    if (!resp.ok) {
+      if (resp.status === 422 && data.detail?.pixel_mask_errors) {
+        showCard("previewCard");
+        $$(".tab").forEach((t) =>
+          t.classList.toggle("active", t.dataset.tab === "masks"));
+        $$(".tabpane").forEach((p) =>
+          p.classList.toggle("hidden", p.id !== "tab-masks"));
+        renderMaskErrors(data.detail.pixel_mask_errors);
+        toast("像素遮罩无法应用，请在遮罩页查看并修正。", true);
+        throw new Error(data.detail.message || "像素遮罩校验失败");
+      }
+      throw new Error((typeof data.detail === "string" ? data.detail
+        : data.detail?.message) || "预览失败");
+    }
+    state.preview = data;
     renderPreview(state.preview);
     showCard("previewCard");
   } catch (err) {
-    toast(err.message, true);
+    // 422 mask errors already surfaced their own dedicated panel.
+    if (!(err.message && err.message.includes("遮罩"))) toast(err.message, true);
   } finally {
     btn.disabled = false; btn.textContent = "生成变更预览";
   }
@@ -438,6 +457,540 @@ $$(".tab").forEach((tab) => tab.addEventListener("click", () => {
 $("#btnBack2").addEventListener("click", () => showCard("configCard"));
 
 // ---------------------------------------------------------------------------
+// Manual pixel mask editor
+// ---------------------------------------------------------------------------
+
+const maskEls = {
+  select: $("#maskFileSelect"),
+  meta: $("#maskMeta"),
+  img: $("#maskImg"),
+  canvas: $("#maskCanvas"),
+  placeholder: $("#maskPlaceholder"),
+  stage: $("#maskStage"),
+  frameLabel: $("#maskFrameLabel"),
+  prev: $("#maskPrevFrame"),
+  next: $("#maskNextFrame"),
+  scope: $("#maskScopeSelect"),
+  del: $("#maskDeleteBtn"),
+  clear: $("#maskClearBtn"),
+  list: $("#maskRectList"),
+  errors: $("#maskErrors"),
+  hint: $("#maskHint"),
+};
+let maskGeometry = null;   // {width,height,frameCount,...} from thumbnail API
+let maskPointer = null;    // active drag state
+let maskLoadToken = 0;     // bumped on every file/frame load (stale-response guard)
+
+function maskableFiles() {
+  const data = state.preview;
+  if (!data) return [];
+  // Only successfully anonymised outputs make sense; skip DICOMDIR/errors.
+  return data.files.filter((f) => !f.error && f.output_path);
+}
+
+function initMaskTab() {
+  const files = maskableFiles();
+  maskEls.select.innerHTML = files
+    .map((f) => `<option value="${f.index}">#${f.index + 1} ${escapeHtml(basename(f.source_path))}</option>`)
+    .join("");
+  if (!files.length) {
+    state.maskActiveFile = null;
+    maskGeometry = null;
+    maskEls.placeholder.textContent = "本次预览没有可用于遮罩的输出影像（非 DICOM 或全部被跳过）。";
+    maskEls.placeholder.classList.remove("hidden");
+    maskEls.img.classList.add("img-hidden");
+    maskEls.img.removeAttribute("src");
+    const ctx0 = maskEls.canvas.getContext("2d");
+    maskEls.canvas.width = 1; maskEls.canvas.height = 1;
+    ctx0.clearRect(0, 0, 1, 1);
+    maskEls.meta.textContent = "无可用影像。";
+    maskEls.frameLabel.textContent = "-";
+    maskEls.list.innerHTML = "";
+    return;
+  }
+  if (state.maskActiveFile == null
+      || !files.some((f) => f.index === state.maskActiveFile)) {
+    state.maskActiveFile = files[0].index;
+  }
+  maskEls.select.value = String(state.maskActiveFile);
+  loadMaskFile(state.maskActiveFile);
+}
+
+async function loadMaskFile(fileIndex) {
+  state.maskActiveFile = fileIndex;
+  if (!state.masks[fileIndex]) state.masks[fileIndex] = { frame: 0, rects: [] };
+  state.maskSelectedId = null;
+  maskGeometry = null;
+  const token = ++maskLoadToken;
+  maskPreviewSeq++;
+  maskEls.placeholder.classList.remove("hidden");
+  maskEls.placeholder.textContent = "正在加载缩略图…";
+  maskEls.img.classList.add("img-hidden");
+  maskEls.meta.textContent = "加载中…";
+  maskEls.list.innerHTML = "";
+  maskEls.hint.textContent = "";
+  try {
+    const resp = await fetch(`/api/jobs/${state.jobId}/thumbnail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_index: fileIndex,
+                             frame: state.masks[fileIndex].frame }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw data;
+    if (token !== maskLoadToken) return;  // user switched file meanwhile
+    maskGeometry = data;
+    state.masks[fileIndex].frame = data.frame_number - 1;
+    maskEls.img.src = data.image_data_url;
+    maskEls.img.classList.remove("img-hidden");
+    maskEls.placeholder.classList.add("hidden");
+    maskEls.img.onload = () => {
+      resizeMaskCanvas();
+      drawMaskCanvas();
+    };
+    maskEls.meta.innerHTML =
+      `${escapeHtml(maskableFiles().find((f) => f.index === fileIndex)?.source_path || "")}<br>` +
+      `原始尺寸 ${data.width} × ${data.height} px · 共 ${data.frame_count} 帧 · ` +
+      `${escapeHtml(data.photometric_interpretation)} · ` +
+      `${data.samples_per_pixel === 3 ? "彩色" : "单色"} ${data.bits_allocated} 位`;
+    updateFrameControls();
+    renderRectList();
+    scheduleServerPreview();
+  } catch (err) {
+    if (token !== maskLoadToken) return;
+    const detail = err?.detail;
+    const errs = detail?.pixel_mask_errors || [];
+    maskGeometry = null;
+    maskEls.img.classList.add("img-hidden");
+    maskEls.placeholder.classList.remove("hidden");
+    maskEls.placeholder.innerHTML =
+      "⛔ 该影像<strong>无法用于像素遮罩</strong>：<br>" +
+      escapeHtml(errs[0]?.message || detail?.message || err?.message || "缩略图加载失败。");
+    maskEls.meta.textContent = "不可遮罩（执行时若提交遮罩将阻止打包）。";
+    maskEls.frameLabel.textContent = "-";
+  }
+}
+
+function updateFrameControls() {
+  const entry = state.masks[state.maskActiveFile];
+  if (!maskGeometry || !entry) return;
+  maskEls.frameLabel.textContent =
+    `第 ${entry.frame + 1} / ${maskGeometry.frame_count} 帧`;
+  maskEls.prev.disabled = entry.frame <= 0;
+  maskEls.next.disabled = entry.frame >= maskGeometry.frame_count - 1;
+}
+
+function resizeMaskCanvas() {
+  // The canvas backing store matches the *displayed* image size; all
+  // coordinates are converted to original pixels before being stored.
+  const rect = maskEls.img.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  maskEls.canvas.width = Math.max(1, Math.round(rect.width * dpr));
+  maskEls.canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  maskEls.canvas.style.width = rect.width + "px";
+  maskEls.canvas.style.height = rect.height + "px";
+  const ctx = maskEls.canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  maskEls.canvas._cssWidth = rect.width;
+  maskEls.canvas._cssHeight = rect.height;
+}
+
+function eventToCanvas(e) {
+  const box = maskEls.canvas.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(box.width, e.clientX - box.left)),
+    y: Math.max(0, Math.min(box.height, e.clientY - box.top)),
+    cssW: box.width, cssH: box.height,
+  };
+}
+
+function canvasToOriginal(p) {
+  return {
+    x: Math.floor(p.x / p.cssW * maskGeometry.width),
+    y: Math.floor(p.y / p.cssH * maskGeometry.height),
+  };
+}
+
+function rectCss(rect) {
+  const w = maskEls.canvas._cssWidth;
+  const h = maskEls.canvas._cssHeight;
+  return {
+    x: rect.x / maskGeometry.width * w,
+    y: rect.y / maskGeometry.height * h,
+    w: rect.w / maskGeometry.width * w,
+    h: rect.h / maskGeometry.height * h,
+  };
+}
+
+function activeScopeRects() {
+  const entry = state.masks[state.maskActiveFile];
+  if (!entry) return [];
+  // Rectangles scoped to "all" apply on every frame view; current-frame
+  // rectangles only show on their frame.
+  return entry.rects.filter((r) =>
+    r.scope === "all" || r.frame === entry.frame);
+}
+
+function hitTestRect(p) {
+  const o = canvasToOriginal(p);
+  const rects = activeScopeRects();
+  for (let i = rects.length - 1; i >= 0; i--) {
+    const r = rects[i];
+    if (o.x >= r.x && o.x < r.x + r.w && o.y >= r.y && o.y < r.y + r.h) {
+      return r;
+    }
+  }
+  return null;
+}
+
+function drawMaskCanvas() {
+  if (!maskGeometry) return;
+  const ctx = maskEls.canvas.getContext("2d");
+  const cssW = maskEls.canvas._cssWidth;
+  const cssH = maskEls.canvas._cssHeight;
+  ctx.clearRect(0, 0, cssW, cssH);
+  // Filled overlay comes from the server-rendered /mask-preview composited
+  // into the <img>; the canvas only draws selection outlines + drag box.
+  ctx.lineWidth = 1.5;
+  for (const r of activeScopeRects()) {
+    const c = rectCss(r);
+    const selected = r.id === state.maskSelectedId;
+    ctx.strokeStyle = r.scope === "all" ? "#ffd166" : "#7dd3fc";
+    if (selected) {
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 2.5;
+    }
+    ctx.strokeRect(c.x + .5, c.y + .5, c.w - 1, c.h - 1);
+    ctx.setLineDash([]);
+    ctx.lineWidth = 1.5;
+  }
+  if (maskPointer && maskPointer.mode === "draw") {
+    const a = maskPointer.startCss;
+    const b = maskPointer.currentCss;
+    ctx.strokeStyle = "#7fb0ff";
+    ctx.strokeRect(
+      Math.min(a.x, b.x), Math.min(a.y, b.y),
+      Math.abs(b.x - a.x), Math.abs(b.y - a.y));
+  }
+}
+
+function renderRectList() {
+  const entry = state.masks[state.maskActiveFile];
+  if (!entry) return;
+  maskEls.list.innerHTML = entry.rects.length
+    ? entry.rects.map((r, i) => `<div class="mask-rect-item ${r.id === state.maskSelectedId ? "active" : ""}" data-id="${r.id}">
+        <span>#${i + 1} 原像素 (${r.x},${r.y}) ${r.w}×${r.h}</span>
+        <span class="scope">${r.scope === "all" ? "全部帧" : `帧 ${r.frame + 1}`}</span>
+        <button type="button" data-del="${r.id}" title="删除">✕</button>
+      </div>`).join("")
+    : `<div class="mask-rect-item"><span class="scope">暂无矩形，在左侧影像上拖框绘制。</span></div>`;
+  $$(".mask-rect-item [data-del]").forEach((btn) =>
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteRect(btn.dataset.del);
+    }));
+  $$(".mask-rect-item").forEach((item) =>
+    item.addEventListener("click", () => {
+      if (item.dataset.id) {
+        state.maskSelectedId = item.dataset.id;
+        const entry2 = state.masks[state.maskActiveFile];
+        const r = entry2.rects.find((x) => x.id === item.dataset.id);
+        if (r && r.scope === "current") entry2.frame = r.frame;
+        drawMaskCanvas();
+        renderRectList();
+        updateFrameControls();
+      }
+    }));
+}
+
+function deleteRect(id) {
+  const entry = state.masks[state.maskActiveFile];
+  entry.rects = entry.rects.filter((r) => r.id !== id);
+  if (state.maskSelectedId === id) state.maskSelectedId = null;
+  drawMaskCanvas();
+  renderRectList();
+  scheduleServerPreview();
+}
+
+let maskIdSeq = 1;
+let maskPreviewTimer = null;
+let maskPreviewSeq = 0;
+
+function scheduleServerPreview() {
+  // Server composites red filled rectangles into the thumbnail; debounce
+  // movement so dragging stays smooth.
+  if (!maskGeometry) return;
+  clearTimeout(maskPreviewTimer);
+  maskPreviewTimer = setTimeout(requestServerPreview, 140);
+}
+
+async function requestServerPreview() {
+  const fileIndex = state.maskActiveFile;
+  const entry = state.masks[fileIndex];
+  if (!entry || !maskGeometry) return;
+  const frame = entry.frame;
+  const token = maskLoadToken;
+  const seq = ++maskPreviewSeq;
+  const rects = activeScopeRects().map((r) => ({
+    x: r.x, y: r.y, width: r.w, height: r.h,
+  }));
+  try {
+    const resp = await fetch(`/api/jobs/${state.jobId}/mask-preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file_index: fileIndex, frame, rectangles: rects,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw data;
+    if (seq !== maskPreviewSeq || token !== maskLoadToken) return;
+    maskEls.img.src = data.image_data_url;
+    maskEls.img.classList.remove("img-hidden");
+    maskEls.img.onload = () => { resizeMaskCanvas(); drawMaskCanvas(); };
+  } catch (err) {
+    // Preview rendering is advisory; application-time validation remains
+    // authoritative and still blocks packaging.
+    if (seq === maskPreviewSeq && token === maskLoadToken) {
+      maskEls.hint.textContent = "遮罩预览渲染失败：" +
+        (err?.detail?.pixel_mask_errors?.[0]?.message
+         || err?.detail?.message || "未知错误");
+    }
+  }
+}
+
+maskEls.canvas.addEventListener("pointerdown", (e) => {
+  if (!maskGeometry) return;
+  e.preventDefault();
+  maskEls.canvas.setPointerCapture(e.pointerId);
+  const p = eventToCanvas(e);
+  const hit = hitTestRect(p);
+  if (hit) {
+    state.maskSelectedId = hit.id;
+    maskPointer = {
+      mode: "move", rect: hit,
+      startOriginal: canvasToOriginal(p),
+      orig: { x: hit.x, y: hit.y },
+    };
+    maskEls.stage.classList.add("dragging");
+  } else {
+    state.maskSelectedId = null;
+    maskPointer = { mode: "draw", startCss: p, currentCss: p };
+  }
+  drawMaskCanvas();
+  renderRectList();
+});
+
+maskEls.canvas.addEventListener("pointermove", (e) => {
+  if (!maskPointer || !maskGeometry) return;
+  const p = eventToCanvas(e);
+  if (maskPointer.mode === "draw") {
+    maskPointer.currentCss = p;
+    drawMaskCanvas();
+  } else {
+    const o = canvasToOriginal(p);
+    const r = maskPointer.rect;
+    const dx = o.x - maskPointer.startOriginal.x;
+    const dy = o.y - maskPointer.startOriginal.y;
+    r.x = Math.max(0, Math.min(maskGeometry.width - r.w,
+                               maskPointer.orig.x + dx));
+    r.y = Math.max(0, Math.min(maskGeometry.height - r.h,
+                               maskPointer.orig.y + dy));
+    drawMaskCanvas();
+    renderRectList();
+    scheduleServerPreview();
+  }
+});
+
+function endPointer(e) {
+  if (!maskPointer || !maskGeometry) { maskPointer = null; return; }
+  const entry = state.masks[state.maskActiveFile];
+  if (maskPointer.mode === "draw") {
+    const a = canvasToOriginal(maskPointer.startCss);
+    const b = canvasToOriginal(maskPointer.currentCss);
+    const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+    const w = Math.abs(b.x - a.x), h = Math.abs(b.y - a.y);
+    // Require at least 2 original pixels so a click does not create noise.
+    if (w >= 2 && h >= 2) {
+      const scope = maskEls.scope.value;
+      const rect = {
+        id: "m" + (maskIdSeq++), x, y, w, h, scope,
+        frame: entry.frame,
+      };
+      entry.rects.push(rect);
+      state.maskSelectedId = rect.id;
+    }
+  }
+  maskPointer = null;
+  maskEls.stage.classList.remove("dragging");
+  drawMaskCanvas();
+  renderRectList();
+  scheduleServerPreview();
+}
+maskEls.canvas.addEventListener("pointerup", endPointer);
+maskEls.canvas.addEventListener("pointercancel", endPointer);
+
+window.addEventListener("keydown", (e) => {
+  if (e.key !== "Delete" && e.key !== "Backspace") return;
+  const pane = $("#tab-masks");
+  if (pane.classList.contains("hidden")) return;
+  if (state.maskSelectedId &&
+      ["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName)) {
+    return;
+  }
+  if (state.maskSelectedId) {
+    e.preventDefault();
+    deleteRect(state.maskSelectedId);
+  }
+});
+
+maskEls.select.addEventListener("change", () =>
+  loadMaskFile(Number(maskEls.select.value)));
+maskEls.prev.addEventListener("click", () => switchFrame(-1));
+maskEls.next.addEventListener("click", () => switchFrame(1));
+maskEls.del.addEventListener("click", () => {
+  if (state.maskSelectedId) deleteRect(state.maskSelectedId);
+});
+maskEls.clear.addEventListener("click", () => {
+  const entry = state.masks[state.maskActiveFile];
+  if (entry && confirm("清空该影像上的全部遮罩矩形？")) {
+    entry.rects = [];
+    state.maskSelectedId = null;
+    drawMaskCanvas();
+    renderRectList();
+    scheduleServerPreview();
+  }
+});
+
+async function switchFrame(delta) {
+  const entry = state.masks[state.maskActiveFile];
+  if (!maskGeometry || !entry) return;
+  const next = entry.frame + delta;
+  if (next < 0 || next >= maskGeometry.frame_count) return;
+  state.maskSelectedId = null;
+  const token = ++maskLoadToken;
+  maskPreviewSeq++;
+  try {
+    const resp = await fetch(`/api/jobs/${state.jobId}/thumbnail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_index: state.maskActiveFile, frame: next }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw data;
+    if (token !== maskLoadToken) return;
+    maskGeometry = data;
+    entry.frame = data.frame_number - 1;
+    maskEls.img.src = data.image_data_url;
+    maskEls.img.classList.remove("img-hidden");
+    maskEls.img.onload = () => { resizeMaskCanvas(); drawMaskCanvas(); };
+    updateFrameControls();
+    renderRectList();
+    scheduleServerPreview();
+  } catch (err) {
+    if (token !== maskLoadToken) return;
+    toast(err?.detail?.pixel_mask_errors?.[0]?.message
+          || err?.detail?.message || "帧切换失败。", true);
+  }
+}
+
+// Redraw on viewport resize (zoom changes the display/original ratio).
+window.addEventListener("resize", () => {
+  if (!$("#previewCard").classList.contains("hidden")
+      && !$("#tab-masks").classList.contains("hidden")
+      && maskGeometry && !maskEls.img.classList.contains("img-hidden")) {
+    resizeMaskCanvas();
+    drawMaskCanvas();
+  }
+});
+
+// Build the request body groups: one group per (file, scope), in original
+// pixel coordinates with 0-based inclusive frame ranges ("all" -> null end).
+function buildMaskGroups() {
+  const groups = [];
+  for (const [fileIndexStr, entry] of Object.entries(state.masks)) {
+    const fileIndex = Number(fileIndexStr);
+    if (!entry.rects.length) continue;
+    const make = (scope) => entry.rects.filter((r) => r.scope === scope);
+    const current = make("current");
+    const all = make("all");
+    if (all.length) {
+      groups.push({
+        file_index: fileIndex, frame_start: 0, frame_end: null,
+        rectangles: all.map((r) => ({ x: r.x, y: r.y,
+                                      width: r.w, height: r.h })),
+      });
+    }
+    // Group current-frame rectangles by their frame number.
+    const byFrame = {};
+    for (const r of current) {
+      (byFrame[r.frame] ||= []).push(r);
+    }
+    for (const [frame, rects] of Object.entries(byFrame)) {
+      groups.push({
+        file_index: fileIndex,
+        frame_start: Number(frame), frame_end: Number(frame),
+        rectangles: rects.map((r) => ({ x: r.x, y: r.y,
+                                        width: r.w, height: r.h })),
+      });
+    }
+  }
+  return groups;
+}
+
+function renderMaskErrors(errs) {
+  if (!errs || !errs.length) {
+    maskEls.errors.classList.add("hidden");
+    maskEls.errors.innerHTML = "";
+    return;
+  }
+  maskEls.errors.classList.remove("hidden");
+  maskEls.errors.innerHTML =
+    `<h4>⛔ ${errs.length} 个文件的像素遮罩无法应用（已阻止打包）</h4><ul>` +
+    errs.map((e) => `<li>文件 #${(e.file_index ?? 0) + 1}` +
+      (e.source_path ? `（${escapeHtml(e.source_path)}）` : "") +
+      `：${escapeHtml(e.message)}</li>`).join("") +
+    `</ul>`;
+}
+
+function renderAppliedMasks(box, pixelMasks) {
+  if (!pixelMasks || !pixelMasks.length) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  const totalRects = pixelMasks.reduce(
+    (s, f) => s + f.regions.reduce((a, r) => a + r.rectangle_count, 0), 0);
+  box.classList.remove("hidden");
+  box.innerHTML =
+    `<h4>▣ 人工像素遮罩：${pixelMasks.length} 个文件 · ${totalRects} 个矩形</h4>
+     <div class="table-wrap"><table>
+       <thead><tr><th>输出文件</th><th>帧范围（起–止）</th><th>帧数</th><th>矩形数</th></tr></thead>
+       <tbody>${pixelMasks.flatMap((f) => f.regions.map((r) => `<tr>
+         <td class="code-cell">${escapeHtml(f.output_path || f.source_path)}</td>
+         <td>${r.frame_start}–${r.frame_end} / ${f.frame_count_total ?? "?"}</td>
+         <td>${r.frame_count}</td>
+         <td>${r.rectangle_count}</td>
+       </tr>`)).join("")}</tbody>
+     </table></div>`;
+}
+
+// Initialize the mask tab every time a fresh preview is rendered.
+const _renderPreviewOrig = renderPreview;
+renderPreview = function(data) {
+  _renderPreviewOrig(data);
+  // Masks drawn for a previous preview keep applying; file indices remain
+  // stable within one job, but entries for now-vanished files are dropped.
+  const valid = new Set(maskableFiles().map((f) => f.index));
+  for (const key of Object.keys(state.masks)) {
+    if (!valid.has(Number(key))) delete state.masks[key];
+  }
+  renderMaskErrors(null);
+  initMaskTab();
+  renderAppliedMasks($("#resultMasks"), data.pixel_masks);
+};
+
+// ---------------------------------------------------------------------------
 // Process & download
 // ---------------------------------------------------------------------------
 
@@ -446,6 +999,7 @@ $("#btnProcess").addEventListener("click", async () => {
     profile: state.profile,
     ...currentOptions(),
     salt: $("#saltInput").value.trim() || null,
+    pixel_masks: buildMaskGroups(),
   };
   const btn = $("#btnProcess");
   btn.disabled = true; btn.textContent = "正在执行匿名化（可能需要一些时间）…";
@@ -457,6 +1011,18 @@ $("#btnProcess").addEventListener("click", async () => {
     });
     const data = await resp.json();
     if (!resp.ok) {
+      // 422: a manual pixel mask cannot be applied (compressed syntax,
+      // undecodable pixels, out-of-range rectangle) -- packaging blocked.
+      if (resp.status === 422 && data.detail?.pixel_mask_errors) {
+        $$(".tab").forEach((t) =>
+          t.classList.toggle("active", t.dataset.tab === "masks"));
+        $$(".tabpane").forEach((p) =>
+          p.classList.toggle("hidden", p.id !== "tab-masks"));
+        renderMaskErrors(data.detail.pixel_mask_errors);
+        showCard("previewCard");
+        toast("像素遮罩无法应用，已阻止打包；请修正遮罩或改用未压缩影像。", true);
+        return;
+      }
       // 409: residual identifier gate blocked ZIP generation -- show the
       // hit table on the preview page instead of a plain toast.
       if (resp.status === 409 && data.detail?.residue_identifier_gate) {
@@ -507,6 +1073,7 @@ function finishJob(data) {
   renderSummary($("#resultSummary"), data.counts, []);
   renderGate($("#resultGate"), data.gate);
   renderWarnings($("#resultWarnings"), data.warnings);
+  renderAppliedMasks($("#resultMasks"), data.pixel_masks);
   showCard("resultCard");
   toast("匿名化完成，ZIP 已就绪。");
 }
@@ -515,6 +1082,10 @@ $("#btnStartOver").addEventListener("click", () => {
   state.jobId = null;
   state.preview = null;
   state.selectedFiles = [];
+  state.masks = {};
+  state.maskActiveFile = null;
+  state.maskSelectedId = null;
+  maskGeometry = null;
   $("#fileInput").value = "";
   $("#dirInput").value = "";
   $("#saltInput").value = "";

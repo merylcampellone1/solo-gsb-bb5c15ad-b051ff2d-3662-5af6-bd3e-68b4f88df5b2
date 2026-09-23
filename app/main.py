@@ -7,11 +7,15 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config
+from . import config, pixel_mask
 from .dicom_catalog import DEFAULT_PROFILE, PROFILES
-from .jobs import STORE, resolve_options, run
+from .jobs import STORE, MaskApplyFailed, _build_mask_groups, resolve_options, run
 from .residue_gate import GateBlocked
-from .schemas import AnonymizationOptions
+from .schemas import (
+    AnonymizationOptions,
+    MaskPreviewRequest,
+    ThumbnailRequest,
+)
 
 app = FastAPI(
     title="DICOM 检查匿名化工作台",
@@ -74,7 +78,8 @@ def _prepare(job_id: str, payload: dict) -> tuple:
         raise HTTPException(status_code=400, detail=str(exc))
     salt = opts_model.salt or config.PSEUDONYM_SALT
     profile_label = PROFILES[profile_name]["label"]
-    return job, profile_name, profile_label, options, salt
+    masks = _build_mask_groups(opts_model.pixel_masks)
+    return job, profile_name, profile_label, options, salt, masks
 
 
 def _serialize(payload: dict, job_id: str, profile_label: str,
@@ -89,15 +94,22 @@ def _serialize(payload: dict, job_id: str, profile_label: str,
         "counts": payload["counts"],
         "patients": payload["patients"],
         "gate": payload.get("gate"),
+        "pixel_masks": payload.get("pixel_masks", []),
     }
 
 
 @app.post("/api/jobs/{job_id}/preview")
 def preview(job_id: str, payload: AnonymizationOptions) -> dict:
-    job, profile_name, profile_label, options, salt = _prepare(
+    job, profile_name, profile_label, options, salt, masks = _prepare(
         job_id, payload.model_dump())
     try:
-        result = run(job, profile_name, options, salt, write=False)
+        result = run(job, profile_name, options, salt, write=False,
+                     masks_by_file=masks)
+    except MaskApplyFailed as failed:
+        raise HTTPException(status_code=422, detail={
+            "message": "人工像素遮罩无法应用，已阻止后续打包。",
+            "pixel_mask_errors": failed.errors,
+        })
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return _serialize(result, job_id, profile_label, options)
@@ -105,13 +117,19 @@ def preview(job_id: str, payload: AnonymizationOptions) -> dict:
 
 @app.post("/api/jobs/{job_id}/process")
 def process(job_id: str, payload: AnonymizationOptions) -> dict:
-    job, profile_name, profile_label, options, salt = _prepare(
+    job, profile_name, profile_label, options, salt, masks = _prepare(
         job_id, payload.model_dump())
 
     # A synchronous route runs in the FastAPI threadpool, so large studies
     # do not block the event loop (preview/status/download stay responsive).
     try:
-        run(job, profile_name, options, salt, write=True)
+        run(job, profile_name, options, salt, write=True,
+            masks_by_file=masks)
+    except MaskApplyFailed as failed:
+        raise HTTPException(status_code=422, detail={
+            "message": str(failed),
+            "pixel_mask_errors": failed.errors,
+        })
     except GateBlocked as blocked:
         raise HTTPException(
             status_code=409,
@@ -135,7 +153,69 @@ def process(job_id: str, payload: AnonymizationOptions) -> dict:
         "warnings": job.last_result["warnings"] if job.last_result else [],
         "counts": job.last_result["counts"] if job.last_result else {},
         "gate": job.last_result.get("gate") if job.last_result else None,
+        "pixel_masks": (job.last_result.get("pixel_masks")
+                        if job.last_result else []),
     }
+
+
+def _get_job_or_404(job_id: str):
+    try:
+        return STORE.get(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期。")
+
+
+def _load_pixel_source(job, file_index: int):
+    if file_index < 0 or file_index >= len(job.sources):
+        raise HTTPException(
+            status_code=404,
+            detail=f"文件序号 {file_index + 1} 不存在（共 "
+                   f"{len(job.sources)} 个上传文件）。")
+    try:
+        ds, layout = pixel_mask.load_for_mask(job.sources[file_index])
+    except pixel_mask.PixelMaskError as exc:
+        exc.file_index = file_index
+        exc.source_path = job.relpaths[file_index]
+        raise HTTPException(status_code=422, detail={
+            "message": "该影像无法用于像素遮罩。",
+            "pixel_mask_errors": [exc.as_dict()],
+        })
+    return ds, layout
+
+
+@app.post("/api/jobs/{job_id}/thumbnail")
+def thumbnail(job_id: str, payload: ThumbnailRequest) -> dict:
+    """Render one frame of an uploaded image as a PNG data URL."""
+    job = _get_job_or_404(job_id)
+    ds, layout = _load_pixel_source(job, payload.file_index)
+    try:
+        return pixel_mask.render_thumbnail(ds, layout, payload.frame)
+    except pixel_mask.PixelMaskError as exc:
+        exc.file_index = payload.file_index
+        exc.source_path = job.relpaths[payload.file_index]
+        raise HTTPException(status_code=422, detail={
+            "message": "缩略图渲染失败。",
+            "pixel_mask_errors": [exc.as_dict()],
+        })
+
+
+@app.post("/api/jobs/{job_id}/mask-preview")
+def mask_preview(job_id: str, payload: MaskPreviewRequest) -> dict:
+    """Render a frame with red outlines showing the active rectangles."""
+    job = _get_job_or_404(job_id)
+    ds, layout = _load_pixel_source(job, payload.file_index)
+    rects = [pixel_mask.Rect(x=r.x, y=r.y, width=r.width, height=r.height)
+             for r in payload.rectangles]
+    try:
+        return pixel_mask.render_mask_preview(ds, layout, payload.frame,
+                                              rects)
+    except pixel_mask.PixelMaskError as exc:
+        exc.file_index = payload.file_index
+        exc.source_path = job.relpaths[payload.file_index]
+        raise HTTPException(status_code=422, detail={
+            "message": "遮罩预览失败。",
+            "pixel_mask_errors": [exc.as_dict()],
+        })
 
 
 @app.get("/api/jobs/{job_id}/status")
@@ -165,6 +245,11 @@ def download(job_id: str):
         raise HTTPException(
             status_code=409,
             detail="残留标识门禁未通过，ZIP 未生成；请调整匿名化选项后重新执行。")
+    if job.status == "error":
+        # Includes failed manual-pixel-mask runs: packaging was blocked.
+        raise HTTPException(
+            status_code=409,
+            detail=job.error or "处理失败，ZIP 未生成；请修正后重新执行。")
     if job.status != "done" or not job.zip_path or \
             not job.zip_path.exists():
         raise HTTPException(status_code=409,

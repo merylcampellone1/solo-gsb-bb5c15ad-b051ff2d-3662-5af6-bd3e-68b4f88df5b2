@@ -15,6 +15,7 @@ from pydicom.dataset import Dataset
 from . import config
 from .anonymizer import Anonymizer, FileInfo
 from .dicom_catalog import PROFILES
+from . import pixel_mask
 from .residue_gate import GateBlocked, IdentifierGate
 
 
@@ -115,6 +116,36 @@ class JobStore:
 STORE = JobStore()
 
 
+class MaskApplyFailed(Exception):
+    """Raised when one or more manual pixel masks cannot be applied.
+
+    The details are locatable (file index/path + reason) and packaging is
+    blocked, because silently shipping an unmasked burned-in region is worse
+    than refusing the run.
+    """
+
+    def __init__(self, errors: list[dict]):
+        self.errors = errors
+        super().__init__("；".join(
+            f"文件 #{e['file_index'] + 1}（{e['source_path']}）: {e['message']}"
+            if e.get("source_path") else e["message"] for e in errors))
+
+
+def _build_mask_groups(payload_masks
+                       ) -> dict[int, list[pixel_mask.MaskGroup]]:
+    """Normalise request masks -> engine groups, keyed by file index."""
+    groups: dict[int, list[pixel_mask.MaskGroup]] = {}
+    for m in payload_masks or []:
+        rects = tuple(pixel_mask.Rect(x=r.x, y=r.y, width=r.width,
+                                      height=r.height)
+                      for r in m.rectangles)
+        group = pixel_mask.MaskGroup(
+            file_index=m.file_index, rectangles=rects,
+            frame_start=m.frame_start, frame_end=m.frame_end)
+        groups.setdefault(m.file_index, []).append(group)
+    return groups
+
+
 def resolve_options(profile_name: str, overrides: dict | None = None
                     ) -> tuple[str, dict[str, bool]]:
     """Merge a profile preset with explicit client-side overrides."""
@@ -167,6 +198,17 @@ def _build_report(profile_name: str, options: dict[str, bool],
              "reason": fi.error}
             for fi in infos if not fi.output_path
         ],
+        # Pixel masks are recorded minimally: path + frame range + count,
+        # never coordinates (they could reveal anatomy/PHI location).
+        "pixel_masks": [
+            {
+                "output_path": fi.output_path,
+                "source_relative_path": fi.source_path,
+                "frame_count_total": fi.frame_count,
+                "regions": fi.mask_records,
+            }
+            for fi in valid if fi.mask_records
+        ],
     }
     if gate_summary is not None:
         report["residue_identifier_gate"] = gate_summary
@@ -203,8 +245,10 @@ def _run_gate(anon: Anonymizer, infos: list[FileInfo],
 
 
 def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
-        write: bool) -> dict:
+        write: bool, masks_by_file:
+        dict[int, list[pixel_mask.MaskGroup]] | None = None) -> dict:
     """Execute a preview (write=False) or a full anonymisation run."""
+    masks_by_file = masks_by_file or {}
     with job.lock:
         job.error = None
         if write:
@@ -220,9 +264,33 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
             job.last_gate = None
 
         infos = _build_file_infos(job)
-        anon = Anonymizer(options=options, salt=salt)
+        anon = Anonymizer(options=options, salt=salt,
+                          masks_by_file=masks_by_file)
 
         anon.prescan(infos, lambda fi: job.sources[fi.index])
+
+        # Referencing a mask on a non-DICOM / out-of-range file is a
+        # locatable client error rather than a silent skip.
+        mask_errors: list[dict] = []
+        for idx in masks_by_file:
+            if idx < 0 or idx >= len(infos):
+                mask_errors.append({
+                    "code": "file_not_found",
+                    "file_index": idx,
+                    "source_path": None,
+                    "message": f"文件序号 {idx + 1} 不存在（共 {len(infos)} 个"
+                               "上传文件）。",
+                })
+            elif not infos[idx].is_dicom:
+                mask_errors.append({
+                    "code": "not_dicom",
+                    "file_index": idx,
+                    "source_path": infos[idx].source_path,
+                    "message": infos[idx].error
+                    or "该文件不是有效的 DICOM 影像，无法应用像素遮罩。",
+                })
+        if mask_errors:
+            raise MaskApplyFailed(mask_errors)
 
         out_root = job.upload_dir.parent / "out"
         if write:
@@ -238,12 +306,30 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
         in_memory: dict[int, Dataset] = {} if not write else None
         for fi in infos:
             if fi.is_dicom:
-                ds = anon.apply_file(fi, job.sources[fi.index],
-                                     out_root if write else None)
+                try:
+                    ds = anon.apply_file(fi, job.sources[fi.index],
+                                         out_root if write else None)
+                except pixel_mask.PixelMaskError as exc:
+                    exc.file_index = fi.index
+                    if exc.source_path is None:
+                        exc.source_path = fi.source_path
+                    mask_errors.append(exc.as_dict())
+                    continue
                 if not write and ds is not None and fi.output_path:
                     in_memory[fi.index] = ds
             else:
                 anon.counts["skipped"] += 1
+
+        if mask_errors:
+            if write:
+                job.status = "error"
+                # Discard every partial output of this failed run so a later
+                # download cannot pick up half-masked files from disk.
+                if out_root.exists():
+                    shutil.rmtree(out_root, ignore_errors=True)
+            job.error = "人工像素遮罩无法应用，已阻止打包：" + \
+                        MaskApplyFailed(mask_errors).args[0]
+            raise MaskApplyFailed(mask_errors)
 
         warnings = list(anon.global_warnings)
         for fi in infos:
@@ -317,6 +403,7 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
             "uid_map": anon.uid_map,
             "profile": profile_name,
             "gate": gate_dict,
+            "pixel_masks": _mask_payload(infos),
         }
         if not write:
             job.last_preview = payload
@@ -324,6 +411,22 @@ def run(job: Job, profile_name: str, options: dict[str, bool], salt: str,
         else:
             job.last_result = payload
         return payload
+
+
+def _mask_payload(infos: list[FileInfo]) -> list[dict]:
+    """Per-file mask summary for the UI (no coordinates)."""
+    out = []
+    for fi in infos:
+        if not fi.mask_records:
+            continue
+        out.append({
+            "file_index": fi.index,
+            "source_path": fi.source_path,
+            "output_path": fi.output_path,
+            "frame_count_total": fi.frame_count,
+            "regions": fi.mask_records,
+        })
+    return out
 
 
 def _file_payload(fi: FileInfo) -> dict:

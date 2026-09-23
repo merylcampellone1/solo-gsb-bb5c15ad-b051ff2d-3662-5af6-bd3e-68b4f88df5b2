@@ -310,20 +310,25 @@ class IdentifierGate:
         self.result.scanned_dicom_files += 1
         # (dataset, location-prefix); file meta information is scanned too.
         stack: list[tuple[Dataset, str]] = [(ds, "")]
-        if ds.file_meta is not None:
-            stack.append((ds.file_meta, "文件元信息 / "))
+        file_meta = getattr(ds, "file_meta", None)
+        if file_meta is not None:
+            stack.append((file_meta, "文件元信息 / "))
         while stack:
             current, prefix = stack.pop()
             for de in current:
                 tag = Tag(de.tag.group, de.tag.element)
                 vr = de.VR or ""
                 label = self._tag_label(tag, de)
-                location = prefix + label
                 if vr == "SQ":
                     if de.value is not None:
+                        # Prefix children with the parent SQ element so hit
+                        # locations show the full nesting chain.
+                        seq_prefix = f"{prefix}{label}"
                         for i, item in enumerate(de.value):
-                            stack.append((item, f"{location}[{i}] / "))
+                            stack.append(
+                                (item, f"{seq_prefix}[{i}] / "))
                     continue
+                location = prefix + label
                 if tag == PIXEL_DATA_TAG or vr in BINARY_VRS:
                     continue
                 if vr == "UI":
@@ -451,6 +456,13 @@ class IdentifierGate:
                 name = de.name
             except Exception:  # noqa: BLE001
                 name = None
+        keyword = pydicom.datadict.keyword_for_tag(tag)
         if not name:
-            name = pydicom.datadict.keyword_for_tag(tag)
-        return f"{token} {name}" if name else token
+            name = keyword
+        if not name:
+            return token
+        # Append the machine keyword (e.g. "SourceImageSequence") so nested
+        # locations are both human-readable and greppable by tag keyword.
+        if keyword and keyword != name:
+            return f"{token} {name} {keyword}"
+        return f"{token} {name}"

@@ -1,10 +1,11 @@
 # DICOM 检查匿名化工作台
 
-一个纯本地运行的 Web 工作台：上传一组 DICOM 影像 → 选择匿名化配置 → **预览逐字段标签变更** → 残留标识门禁扫描 → 一键打包下载匿名化 ZIP。无需任何第三方账号，不向外部发送数据。
+一个纯本地运行的 Web 工作台：上传一组 DICOM 影像 → 选择匿名化配置 → **预览逐字段标签变更** → **人工绘制像素矩形遮罩** → 残留标识门禁扫描 → 一键打包下载匿名化 ZIP。无需任何第三方账号，不向外部发送数据。
 
 - **后端**：FastAPI + [pydicom](https://pydicom.github.io/)
 - **前端**：原生 HTML/CSS/JS 单页应用（无 CDN、无构建步骤）
 - **规范**：遵循 DICOM PS3.15 Annex E「基础应用保密配置文件」及标准保留选项
+- **像素遮罩**：在输出影像缩略图上绘制/移动/删除矩形，执行时按原始像素坐标在所选帧范围填充安全背景色（不引入任何图像处理库，PNG 缩略图由标准库生成）
 - **交付**：Dockerfile + docker-compose，单条命令启动；镜像仅含 Python 运行时与 PyPI 依赖，**无需注册任何第三方账号 / 云服务**
 
 ---
@@ -76,11 +77,12 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 3. **预览**：
    - 统计磁贴（删除/置空/伪名替换/UID 重写/日期平移/剥离私有标签数量）
    - **逐字段变更清单**：标签号、名称、VR、动作、原值 → 新值，支持搜索、按动作过滤、分页
+   - **人工像素遮罩**：选择一个输出影像 → 显示带窗宽窗位的缩略图 → 拖框绘制矩形（可移动、删除），选择「仅当前帧」或「全部帧」，前端按缩略图缩放比例换算为**原始像素坐标**提交；遮罩预览由服务器实时合成
    - 每个文件的 Patient / Study / Series / SOP UID 原 → 新映射
    - 患者伪名表与每患者日期平移天数
    - **残留标识门禁结果**：扫描文件数/文本值数、比对的源标识数与命中计数（见下节）
    - 警告（悬挂引用、`Burned In Annotation`、重复 SOP UID 等）
-4. **执行与下载**：执行后再次运行门禁；**通过**才打包 ZIP，内部以 `新StudyUID/新SeriesUID/新SOPUID.dcm` 组织，并附 `anonymization-report.json`（只含新标识、统计与门禁摘要，不含原值）；**未通过则阻止 ZIP 生成/下载**并逐行列出命中文件、标签与命中类型。
+4. **执行与下载**：执行时先应用像素遮罩（保持多帧尺寸、窗宽窗位与 PhotometricInterpretation、传输语法仍为未压缩），再运行门禁；**通过**才打包 ZIP，内部以 `新StudyUID/新SeriesUID/新SOPUID.dcm` 组织，并附 `anonymization-report.json`（只含新标识、统计、门禁摘要与遮罩路径/帧范围/矩形计数，不含原值/坐标）；**未通过则阻止 ZIP 生成/下载**并逐行列出命中文件、标签与命中类型。压缩传输语法 / 无法解码 / 坐标越界的遮罩请求返回 **422**（携带文件序号、路径与原因）并阻止打包。
 
 ---
 
@@ -113,9 +115,20 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 - **私有标签**（odd group / private creator）无条件剥离（基础保密配置文件要求）；
 - `strip_overlays`：移除 60xx 覆盖层、50xx 曲线与图形注释序列（可能烧录文字）；
 - 人员姓名（PN）、机构、设备、医护、Accession、描述/注释等按所选选项保留或清空；
-- 写入去标识声明：`PatientIdentityRemoved = YES`、`De-identificationMethod` 及标准代码序列（113100 等）；
-- `Burned In Annotation = YES` / `Recognizable Visual Features = YES` 时给出像素级人工核查警告（工具**不修改像素**）；
+- 写入去标识声明：`PatientIdentityRemoved = YES`、`De-identificationMethod` 及标准代码序列（113100、人工像素遮罩 113110 等）；
+- `Burned In Annotation = YES` / `Recognizable Visual Features = YES` 时给出像素级人工核查警告，并引导使用「人工像素遮罩」；
 - DICOMDIR 跳过并警告（其记录基于原 UID，需用介质工具重建）。
+
+### 人工像素遮罩（Manual Rectangular Pixel Masks）
+
+标签规则无法清除**烧录在像素中的身份信息**（姓名条、床号、面部特征）。预览页提供逐文件的矩形遮罩编辑器：
+
+- **缩略图**：`POST /api/jobs/{id}/thumbnail` 读取上传影像，按数据集自身的窗宽窗位（`WindowCenter/WindowWidth` + `RescaleSlope/Intercept`）渲染单帧，无窗值时按 min-max 自适应；支持 `MONOCHROME1/2`、`RGB`、`YBR_FULL`、`PALETTE COLOR`，8/16 位、像素逐点/平面逐点（Planar Configuration 0/1）、有符号像素；最长边缩至 1024 px 以内，返回原始宽高、总帧数与 PNG data URL（纯标准库 zlib/struct 编码，无 Pillow/numpy）。
+- **交互**：在缩略图上拖框绘制矩形、拖动移动、`Delete` 或按钮删除；矩形坐标由显示尺寸按比例换算为**原始像素坐标**（半开区间），可选择「仅当前帧」或「全部帧」；`POST /api/jobs/{id}/mask-preview` 返回服务器合成的红色描边预览。
+- **执行**：`pixel_masks` 随 preview/process 请求提交（结构：`file_index` + 0 基闭区间 `frame_start/frame_end`，`frame_end=null` 表示到最后一帧 + 原始像素矩形数组）；同帧多个矩形可合并为一组。填充值按 PhotometricInterpretation 取**安全背景色**：`MONOCHROME2`/`RGB`/`YBR_FULL`/`PALETTE COLOR` 填存储最小值 0，`MONOCHROME1`（值越大越黑）填该位深最大值。
+- **保持不变**：多帧数与帧尺寸、`Rows/Columns`、`WindowWidth/WindowCenter`、`PhotometricInterpretation`、`SamplesPerPixel`、`PlanarConfiguration` 与传输语法（仅原地改写 `PixelData`，不引入封装）。
+- **可定位错误并阻止打包**：压缩传输语法（JPEG/JPEG-LS/JPEG2000 等封装像素，工具不内置编解码器）、缺失/截断 `PixelData`、不支持的位深/采样数、矩形或帧号越界，统一以 **422** 返回 `{code, file_index, source_path, message}`；执行阶段失败会删除本次半成品输出并使既有 ZIP 的下载链接失效（下载返回 409）。压缩文件请先用 `dcmdjpeg` 等工具解压后再上传。
+- **报告最小化**：`anonymization-report.json` 的 `pixel_masks` 仅记录输出路径、源相对路径、总帧数，以及每段帧范围（1 基起–止）、帧数与矩形计数；**不含任何像素坐标**（坐标本身可能暗示解剖/身份位置）。API 的 process 响应携带同样的最小化结构供结果页展示。
 
 ### 残留标识门禁（Residual Identifier Gate）
 
@@ -130,7 +143,7 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
    - 执行时：`POST /process` 返回 `409`，**不生成 ZIP**；任务状态为 `blocked`，下载接口同样返回 `409`；
    - 通过时：预览/结果页显示绿色「扫描通过」与命中计数 0；门禁摘要（扫描文件数、比对标识数、各类命中数，**只含计数**）写入 `anonymization-report.json` 的 `residue_identifier_gate` 字段。
 
-> 门禁的作用是拦截标签层面的意外泄漏，**不能替代像素中烧录文字的人工核查**；此外「悬挂引用警告」会原样写出被引用的原始 UID（该对象不在本次上传中），门禁同样会据此拦截并提示——这是设计行为：发布包不应出现任何原始 UID。
+> 门禁的作用是拦截标签层面的意外泄漏，**不能替代像素中烧录文字的人工核查**——烧录区域需在预览页用「人工像素遮罩」覆盖；此外「悬挂引用警告」会原样写出被引用的原始 UID（该对象不在本次上传中），门禁同样会据此拦截并提示——这是设计行为：发布包不应出现任何原始 UID。
 
 ### 预设方案
 
@@ -141,7 +154,7 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 | **推荐** | 科研外发 | 日期固定偏移（纵向间隔一致）、保留年龄/性别与协议名、剥离覆盖层 |
 | 严格 | 最大化去标识 | 清空一切日期/特征/自由文本、剥离私有标签与覆盖层 |
 
-> **注意**：任何 DICOM 标签层面的去标识都无法处理**像素中烧录的文字**（姓名、床号、面部特征）。本工具会读取 `(0028,0301)` 等标记提示风险，但发布前仍需人工核查影像内容。
+> **注意**：任何 DICOM 标签层面的去标识都无法自动处理**像素中烧录的文字**（姓名、床号、面部特征）。本工具会读取 `(0028,0301)` 等标记提示风险，并提供「人工像素遮罩」由审阅者在缩略图上逐帧/整段覆盖；遮罩仅限**未压缩**像素数据，压缩影像需先解压再上传。发布前仍需人工核查影像内容。
 
 ---
 
@@ -166,10 +179,12 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
 | `GET` | `/api/health` | 健康检查 |
 | `GET` | `/api/profiles` | 预设方案与选项定义 |
 | `POST` | `/api/jobs` | 上传文件（multipart，字段名 `files`，可多个） |
-| `POST` | `/api/jobs/{id}/preview` | 计算变更预览（不落盘），返回 `gate` 门禁扫描结果 |
-| `POST` | `/api/jobs/{id}/process` | 执行匿名化；门禁通过才生成 ZIP，否则返回 `409`（明细在 `detail.residue_identifier_gate.hits`） |
+| `POST` | `/api/jobs/{id}/thumbnail` | 渲染指定文件某一帧的 PNG 缩略图（`{file_index, frame}`，0 基帧号） |
+| `POST` | `/api/jobs/{id}/mask-preview` | 合成矩形遮罩预览（`{file_index, frame, rectangles[]}`），矩形为原始像素坐标 |
+| `POST` | `/api/jobs/{id}/preview` | 计算变更预览（不落盘），返回 `gate` 门禁扫描结果与 `pixel_masks` 应用结果 |
+| `POST` | `/api/jobs/{id}/process` | 执行匿名化与像素遮罩；遮罩无法应用返回 **422**（明细在 `detail.pixel_mask_errors`），门禁失败返回 `409`（明细在 `detail.residue_identifier_gate.hits`） |
 | `GET` | `/api/jobs/{id}/status` | 任务状态（`uploaded/previewed/processing/done/blocked/error`） |
-| `GET` | `/api/jobs/{id}/download` | 下载 ZIP（状态为 `blocked` 时返回 `409`） |
+| `GET` | `/api/jobs/{id}/download` | 下载 ZIP（`blocked/error` 或未生成时返回 `409`） |
 | `DELETE` | `/api/jobs/{id}` | 立即删除任务及其文件 |
 
 预览/执行请求体示例：
@@ -180,11 +195,29 @@ docker rm dicombench          # 删除容器（数据卷 dicombench-data 保留�
   "keep_dates": true,
   "keep_chars": true,
   "strip_overlays": true,
-  "salt": null
+  "salt": null,
+  "pixel_masks": [
+    {
+      "file_index": 2,
+      "frame_start": 0,
+      "frame_end": null,
+      "rectangles": [
+        {"x": 120, "y": 8, "width": 260, "height": 28}
+      ]
+    },
+    {
+      "file_index": 3,
+      "frame_start": 4,
+      "frame_end": 4,
+      "rectangles": [
+        {"x": 10, "y": 10, "width": 60, "height": 40}
+      ]
+    }
+  ]
 }
 ```
 
-所有选项字段省略或传 `null` 时沿用所选预设；显式传 `true`/`false` 覆盖预设。
+帧号为 **0 基、闭区间**，`frame_end: null` 表示应用到最后一帧；矩形坐标为**原始像素**半开区间 `[x, x+width) × [y, y+height)`。所有选项字段省略或传 `null` 时沿用所选预设；显式传 `true`/`false` 覆盖预设。`pixel_masks` 省略或为空数组时行为与旧版一致（不触碰像素）。
 
 API 文档（Swagger UI）：<http://localhost:8000/docs>。
 
@@ -194,15 +227,16 @@ API 文档（Swagger UI）：<http://localhost:8000/docs>。
 
 ```
 app/
-  main.py            # FastAPI 路由 / 静态页面
-  jobs.py            # 任务生命周期、预览调度、门禁接入、ZIP 打包与报告
-  anonymizer.py      # 伪名 / UID 映射 / 日期平移 / 递归序列遍历引擎
+  main.py            # FastAPI 路由 / 静态页面（含缩略图与遮罩预览端点）
+  jobs.py            # 任务生命周期、预览调度、门禁接入、遮罩错误处理、ZIP 打包与报告
+  anonymizer.py      # 伪名 / UID 映射 / 日期平移 / 递归序列遍历引擎 / 遮罩接入
+  pixel_mask.py      # 人工矩形遮罩：像素布局校验、安全背景填充、窗宽窗位渲染、PNG 编码
   residue_gate.py    # 残留标识门禁：递归扫描输出 DICOM（含序列）与报告
   dicom_catalog.py   # PS3.15 标签规则表与 4 个预设方案
-  schemas.py         # 请求/响应模型（含门禁结果模型）
+  schemas.py         # 请求/响应模型（含遮罩模型与门禁结果模型）
   config.py          # 环境变量配置
-  static/            # 单页前端（index.html / app.js / style.css）
-tests/               # 引擎、门禁与端到端 HTTP 测试（pytest）
+  static/            # 单页前端（index.html / app.js / style.css，含画布遮罩编辑器）
+tests/               # 引擎、门禁、遮罩（单元+HTTP）与端到端 pytest 测试
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -212,7 +246,10 @@ requirements.txt
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
-pytest -q          # 36 项测试：UID 一致性、引用遍历、确定性、日期间隔、
+pytest -q          # 64 项测试：UID 一致性、引用遍历、确定性、日期间隔、
                    #          残留标识门禁（分词/边界、序列深层命中、
-                   #          409 拦截、报告摘要）等
+                   #          409 拦截、报告摘要）、
+                   #          人工像素遮罩（MONOCHROME1/2、RGB/YBR、调色板、
+                   #          多帧帧范围、窗宽窗位保持、压缩语法 422 阻止打包、
+                   #          报告仅记录路径/帧范围/矩形计数）等
 ```

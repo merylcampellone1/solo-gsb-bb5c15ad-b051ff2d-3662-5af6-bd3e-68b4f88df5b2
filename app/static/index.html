@@ -87,6 +87,7 @@
     <div class="tabs">
       <button class="tab active" data-tab="changes">逐字段变更</button>
       <button class="tab" data-tab="files">影像文件 / UID 映射</button>
+      <button class="tab" data-tab="masks">人工像素遮罩</button>
       <button class="tab" data-tab="patients">患者伪名</button>
     </div>
 
@@ -128,6 +129,50 @@
       </div>
     </div>
 
+    <div id="tab-masks" class="tabpane hidden">
+      <p class="hint">在输出影像缩略图上<strong>拖框绘制</strong>矩形遮罩，拖动矩形可移动，选中后按 <code>Delete</code> 或点“删除选中”移除。所有坐标按缩略图缩放比例换算为<strong>原始像素坐标</strong>提交；可选择“当前帧”或“全部帧”。执行时对应帧的矩形区域将填充安全背景色（MONOCHROME1 填白、其余填黑），帧尺寸、窗宽窗位与 PhotometricInterpretation 保持不变。压缩传输语法 / 无法解码的影像无法遮罩并会阻止打包。</p>
+
+      <div id="maskErrors" class="mask-errors hidden"></div>
+
+      <div class="mask-layout">
+        <div class="mask-sidebar">
+          <label class="mask-field">
+            输出影像
+            <select id="maskFileSelect"></select>
+          </label>
+          <div class="mask-meta" id="maskMeta">尚未加载影像。</div>
+          <div class="mask-frames">
+            <button type="button" id="maskPrevFrame" class="btn small">上一帧</button>
+            <span id="maskFrameLabel" class="muted">-</span>
+            <button type="button" id="maskNextFrame" class="btn small">下一帧</button>
+          </div>
+          <label class="mask-field">
+            新矩形应用范围
+            <select id="maskScopeSelect">
+              <option value="current">仅当前帧</option>
+              <option value="all">全部帧</option>
+            </select>
+          </label>
+          <div class="actions" style="justify-content:flex-start">
+            <button type="button" id="maskDeleteBtn" class="btn small">删除选中</button>
+            <button type="button" id="maskClearBtn" class="btn small ghost">清空本影像</button>
+          </div>
+          <div id="maskRectList" class="mask-rect-list"></div>
+        </div>
+
+        <div class="mask-canvas-wrap">
+          <div id="maskStage" class="mask-stage">
+            <img id="maskImg" class="img-hidden" alt="输出影像缩略图">
+            <canvas id="maskCanvas"></canvas>
+            <div id="maskPlaceholder" class="mask-placeholder">
+              请选择一个可解码的未压缩输出影像
+            </div>
+          </div>
+          <div id="maskHint" class="muted"></div>
+        </div>
+      </div>
+    </div>
+
     <div id="tab-patients" class="tabpane hidden">
       <div class="table-wrap">
         <table>
@@ -151,6 +196,7 @@
   <section class="card hidden" id="resultCard">
     <h2>④ 完成</h2>
     <div id="resultSummary" class="summary"></div>
+    <div id="resultMasks" class="mask-result hidden"></div>
     <div id="resultGate" class="gate hidden"></div>
     <div id="resultWarnings" class="warnings hidden"></div>
     <div class="actions">
